@@ -1,0 +1,62 @@
+name: LLaMA Worker 2
+
+on:
+  workflow_dispatch:
+
+jobs:
+  worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake git
+
+      - name: Build llama.cpp
+        run: |
+          git clone https://github.com/ggerganov/llama.cpp.git
+          cd llama.cpp
+          cmake -B build
+          cmake --build build --config Release -j$(nproc)
+
+      - name: Install Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+
+      - name: Connect to Tailscale network
+        run: |
+          sudo tailscale up \
+            --authkey ${{ secrets.TAILSCALE_AUTHKEY }} \
+            --hostname=llama-worker2-${{ github.run_id }} \
+            --accept-routes
+
+      - name: Display Tailscale IP
+        id: get-ip
+        run: |
+          WORKER_IP=$(tailscale ip -4)
+          echo "WORKER_IP=$WORKER_IP" >> $GITHUB_OUTPUT
+          echo ""
+          echo "========================================"
+          echo "  WORKER 2 IS READY"
+          echo "  Tailscale IP: $WORKER_IP"
+          echo "  Use this IP in the Main Server workflow"
+          echo "========================================"
+          echo ""
+
+      - name: Start RPC server
+        run: |
+          cd llama.cpp
+          echo "Starting llama-rpc-server on port 50052..."
+          ./build/bin/llama-rpc-server -H 0.0.0.0 -p 50052 &
+          
+          echo "RPC server running. Keeping alive for 6 hours..."
+          sleep 21540
+
+      - name: Cleanup on exit
+        if: always()
+        run: |
+          echo "Shutting down..."
+          pkill -f llama-rpc-server || true
+          sudo tailscale down || true
