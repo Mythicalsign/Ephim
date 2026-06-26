@@ -1,0 +1,155 @@
+name: LLaMA Main Server
+
+on:
+  workflow_dispatch:
+    inputs:
+      worker1_ip:
+        description: 'Worker 1 Tailscale IP (e.g., 100.x.x.x)'
+        required: true
+        type: string
+      worker2_ip:
+        description: 'Worker 2 Tailscale IP (e.g., 100.x.x.x)'
+        required: true
+        type: string
+      api_key:
+        description: 'API key for securing the server'
+        required: true
+        type: string
+        default: 'sk-devstral-local'
+
+jobs:
+  main-server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake git wget
+
+      - name: Build llama.cpp
+        run: |
+          git clone https://github.com/ggerganov/llama.cpp.git
+          cd llama.cpp
+          cmake -B build
+          cmake --build build --config Release -j$(nproc)
+
+      - name: Install Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+
+      - name: Connect to Tailscale network
+        run: |
+          sudo tailscale up \
+            --authkey ${{ secrets.TAILSCALE_AUTHKEY }} \
+            --hostname=llama-main-${{ github.run_id }} \
+            --accept-routes
+
+      - name: Display main server Tailscale IP
+        id: get-ip
+        run: |
+          MAIN_IP=$(tailscale ip -4)
+          echo "MAIN_IP=$MAIN_IP" >> $GITHUB_OUTPUT
+          echo ""
+          echo "========================================"
+          echo "  MAIN SERVER TAILSCALE IP"
+          echo "  $MAIN_IP"
+          echo "========================================"
+          echo ""
+
+      - name: Download Devstral model
+        run: |
+          cd llama.cpp
+          mkdir -p models
+          
+          echo "Installing huggingface-hub..."
+          pip install -q huggingface-hub
+          
+          echo "Downloading Devstral-Small-2507-Q6_K.gguf (~19GB)..."
+          echo "This will take several minutes..."
+          huggingface-cli download \
+            unsloth/Devstral-Small-2507-GGUF \
+            Devstral-Small-2507-Q6_K.gguf \
+            --local-dir ./models
+          
+          echo "Download complete."
+          ls -lh models/
+
+      - name: Verify workers are reachable
+        run: |
+          echo "Pinging workers..."
+          echo "Worker 1: ${{ inputs.worker1_ip }}"
+          ping -c 3 ${{ inputs.worker1_ip }} || echo "Warning: Worker 1 may not be ready"
+          
+          echo ""
+          echo "Worker 2: ${{ inputs.worker2_ip }}"
+          ping -c 3 ${{ inputs.worker2_ip }} || echo "Warning: Worker 2 may not be ready"
+          
+          echo ""
+          echo "Waiting 10 seconds for any stragglers..."
+          sleep 10
+
+      - name: Start llama server
+        run: |
+          cd llama.cpp
+          
+          MAIN_IP=$(tailscale ip -4)
+          
+          echo ""
+          echo "========================================"
+          echo "  STARTING LLAMA SERVER"
+          echo "  Model: Devstral-Small-2507-Q6_K.gguf"
+          echo "  Workers: ${{ inputs.worker1_ip }}:50052, ${{ inputs.worker2_ip }}:50052"
+          echo "  API Key: ${{ inputs.api_key }}"
+          echo "  Context: 32768"
+          echo "========================================"
+          echo ""
+          
+          ./build/bin/llama-server \
+            -m models/Devstral-Small-2507-Q6_K.gguf \
+            --rpc ${{ inputs.worker1_ip }}:50052,${{ inputs.worker2_ip }}:50052 \
+            -c 32768 \
+            --cache-type-k q8_0 \
+            --host 0.0.0.0 \
+            --port 8080 \
+            --api-key "${{ inputs.api_key }}" \
+            --jinja \
+            -fa &
+          
+          LLAMA_PID=$!
+          echo "Server PID: $LLAMA_PID"
+          
+          echo ""
+          echo "Waiting for server to initialize..."
+          sleep 15
+          
+          echo ""
+          echo "========================================"
+          echo "  SERVER IS RUNNING"
+          echo ""
+          echo "  API Endpoint: http://$MAIN_IP:8080"
+          echo "  Health Check: http://$MAIN_IP:8080/health"
+          echo ""
+          echo "  Configure Cline with:"
+          echo "  Base URL: http://$MAIN_IP:8080/v1"
+          echo "  API Key: ${{ inputs.api_key }}"
+          echo "  Model: devstral-small-2507"
+          echo ""
+          echo "  Test with:"
+          echo "  curl http://$MAIN_IP:8080/v1/models \\"
+          echo "    -H \"Authorization: Bearer ${{ inputs.api_key }}\""
+          echo ""
+          echo "  This server will run for ~6 hours"
+          echo "========================================"
+          echo ""
+          
+          # Keep alive for 6 hours
+          sleep 21540
+
+      - name: Cleanup on exit
+        if: always()
+        run: |
+          echo "Shutting down server..."
+          pkill -f llama-server || true
+          sudo tailscale down || true
