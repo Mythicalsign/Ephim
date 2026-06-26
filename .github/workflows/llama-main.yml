@@ -28,11 +28,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential cmake git wget
 
-      - name: Build llama.cpp
+      - name: Build llama.cpp with RPC support
         run: |
           git clone https://github.com/ggerganov/llama.cpp.git
           cd llama.cpp
-          cmake -B build
+          cmake -B build -DGGML_RPC=ON
           cmake --build build --config Release -j$(nproc)
 
       - name: Install Tailscale
@@ -76,7 +76,6 @@ jobs:
                  "https://huggingface.co/unsloth/Devstral-Small-2507-GGUF/resolve/main/Devstral-Small-2507-Q6_K.gguf"
           else
             echo "WARNING: No HF_TOKEN found. Anonymous downloads are heavily throttled."
-            echo "This may take 5+ hours. Add HF_TOKEN secret for faster download."
             wget --progress=dot:giga \
                  -O models/Devstral-Small-2507-Q6_K.gguf \
                  "https://huggingface.co/unsloth/Devstral-Small-2507-GGUF/resolve/main/Devstral-Small-2507-Q6_K.gguf"
@@ -100,7 +99,9 @@ jobs:
           echo "Waiting 10 seconds for any stragglers..."
           sleep 10
 
-      - name: Start llama server
+      - name: Start llama server with RPC
+        env:
+          GGML_RPC_SERVERS: "${{ inputs.worker1_ip }}:50052,${{ inputs.worker2_ip }}:50052"
         run: |
           cd llama.cpp
           
@@ -110,7 +111,7 @@ jobs:
           echo "========================================"
           echo "  STARTING LLAMA SERVER"
           echo "  Model: Devstral-Small-2507-Q6_K.gguf"
-          echo "  Workers: ${{ inputs.worker1_ip }}:50052, ${{ inputs.worker2_ip }}:50052"
+          echo "  RPC Workers: $GGML_RPC_SERVERS"
           echo "  API Key: ${{ inputs.api_key }}"
           echo "  Context: 32768"
           echo "========================================"
@@ -118,7 +119,6 @@ jobs:
           
           ./build/bin/llama-server \
             -m models/Devstral-Small-2507-Q6_K.gguf \
-            --rpc ${{ inputs.worker1_ip }}:50052,${{ inputs.worker2_ip }}:50052 \
             -c 32768 \
             --cache-type-k q8_0 \
             --host 0.0.0.0 \
@@ -132,7 +132,7 @@ jobs:
           
           echo ""
           echo "Waiting for server to initialize..."
-          sleep 15
+          sleep 20
           
           echo ""
           echo "========================================"
