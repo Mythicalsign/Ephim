@@ -1,104 +1,3 @@
-name: LLaMA Main Server
-
-on:
-  workflow_dispatch:
-    inputs:
-      worker1_ip:
-        description: 'Worker 1 Tailscale IP (e.g., 100.x.x.x)'
-        required: true
-        type: string
-      worker2_ip:
-        description: 'Worker 2 Tailscale IP (e.g., 100.x.x.x)'
-        required: true
-        type: string
-      api_key:
-        description: 'API key for securing the server'
-        required: true
-        type: string
-        default: 'sk-devstral-local'
-
-jobs:
-  main-server:
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
-
-    steps:
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential cmake git wget
-
-      - name: Build llama.cpp with RPC support
-        run: |
-          git clone https://github.com/ggerganov/llama.cpp.git
-          cd llama.cpp
-          cmake -B build -DGGML_RPC=ON
-          cmake --build build --config Release -j$(nproc)
-
-      - name: Install Tailscale
-        run: |
-          curl -fsSL https://tailscale.com/install.sh | sh
-
-      - name: Connect to Tailscale network
-        run: |
-          sudo tailscale up \
-            --authkey ${{ secrets.TAILSCALE_AUTHKEY }} \
-            --hostname=llama-main-${{ github.run_id }} \
-            --accept-routes
-
-      - name: Display main server Tailscale IP
-        id: get-ip
-        run: |
-          MAIN_IP=$(tailscale ip -4)
-          echo "MAIN_IP=$MAIN_IP" >> $GITHUB_OUTPUT
-          echo ""
-          echo "========================================"
-          echo "  MAIN SERVER TAILSCALE IP"
-          echo "  $MAIN_IP"
-          echo "========================================"
-          echo ""
-
-      - name: Download Devstral model
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: |
-          cd llama.cpp
-          mkdir -p models
-          
-          echo "Downloading Devstral-Small-2507-Q6_K.gguf (~19GB)..."
-          echo "Started at: $(date)"
-          
-          if [ -n "$HF_TOKEN" ]; then
-            echo "Using authenticated download (faster)..."
-            wget --header="Authorization: Bearer $HF_TOKEN" \
-                 --progress=dot:giga \
-                 -O models/Devstral-Small-2507-Q6_K.gguf \
-                 "https://huggingface.co/unsloth/Devstral-Small-2507-GGUF/resolve/main/Devstral-Small-2507-Q6_K.gguf"
-          else
-            echo "WARNING: No HF_TOKEN found. Anonymous downloads are heavily throttled."
-            wget --progress=dot:giga \
-                 -O models/Devstral-Small-2507-Q6_K.gguf \
-                 "https://huggingface.co/unsloth/Devstral-Small-2507-GGUF/resolve/main/Devstral-Small-2507-Q6_K.gguf"
-          fi
-          
-          echo ""
-          echo "Download finished at: $(date)"
-          ls -lh models/
-
-      - name: Verify workers are reachable
-        run: |
-          echo "Pinging workers..."
-          echo "Worker 1: ${{ inputs.worker1_ip }}"
-          ping -c 3 ${{ inputs.worker1_ip }} || echo "Warning: Worker 1 may not be ready"
-          
-          echo ""
-          echo "Worker 2: ${{ inputs.worker2_ip }}"
-          ping -c 3 ${{ inputs.worker2_ip }} || echo "Warning: Worker 2 may not be ready"
-          
-          echo ""
-          echo "Waiting 10 seconds for any stragglers..."
-          sleep 10
-
       - name: Start llama server with RPC
         env:
           GGML_RPC_SERVERS: "${{ inputs.worker1_ip }}:50052,${{ inputs.worker2_ip }}:50052"
@@ -125,7 +24,7 @@ jobs:
             --port 8080 \
             --api-key "${{ inputs.api_key }}" \
             --jinja \
-            -fa &
+            --flash-attn on &
           
           LLAMA_PID=$!
           echo "Server PID: $LLAMA_PID"
@@ -154,12 +53,4 @@ jobs:
           echo "========================================"
           echo ""
           
-          # Keep alive for 6 hours
           sleep 21540
-
-      - name: Cleanup on exit
-        if: always()
-        run: |
-          echo "Shutting down server..."
-          pkill -f llama-server || true
-          sudo tailscale down || true
