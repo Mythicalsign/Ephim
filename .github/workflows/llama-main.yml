@@ -35,6 +35,11 @@ jobs:
           cmake -B build -DGGML_RPC=ON
           cmake --build build --config Release -j$(nproc)
 
+      - name: Verify RPC binary exists
+        run: |
+          ls -la llama.cpp/build/bin/llama-server
+          llama.cpp/build/bin/llama-server --help | grep -i rpc || echo "RPC not enabled in build"
+
       - name: Install Tailscale
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
@@ -76,7 +81,6 @@ jobs:
                  "https://huggingface.co/unsloth/Devstral-Small-2507-GGUF/resolve/main/Devstral-Small-2507-Q6_K.gguf"
           else
             echo "WARNING: No HF_TOKEN found. Anonymous downloads are heavily throttled."
-            echo "This may take 5+ hours. Add HF_TOKEN secret for faster download."
             wget --progress=dot:giga \
                  -O models/Devstral-Small-2507-Q6_K.gguf \
                  "https://huggingface.co/unsloth/Devstral-Small-2507-GGUF/resolve/main/Devstral-Small-2507-Q6_K.gguf"
@@ -101,8 +105,6 @@ jobs:
           sleep 10
 
       - name: Start llama server with RPC
-        env:
-          GGML_RPC_SERVERS: "${{ inputs.worker1_ip }}:50052,${{ inputs.worker2_ip }}:50052"
         run: |
           cd llama.cpp
           
@@ -112,7 +114,7 @@ jobs:
           echo "========================================"
           echo "  STARTING LLAMA SERVER"
           echo "  Model: Devstral-Small-2507-Q6_K.gguf"
-          echo "  RPC Workers: $GGML_RPC_SERVERS"
+          echo "  Workers: ${{ inputs.worker1_ip }}:50052, ${{ inputs.worker2_ip }}:50052"
           echo "  API Key: ${{ inputs.api_key }}"
           echo "  Context: 32768"
           echo "========================================"
@@ -120,13 +122,15 @@ jobs:
           
           ./build/bin/llama-server \
             -m models/Devstral-Small-2507-Q6_K.gguf \
+            --rpc ${{ inputs.worker1_ip }}:50052,${{ inputs.worker2_ip }}:50052 \
             -c 32768 \
             --cache-type-k q8_0 \
             --host 0.0.0.0 \
             --port 8080 \
             --api-key "${{ inputs.api_key }}" \
             --jinja \
-            --flash-attn on &
+            --flash-attn on \
+            -ngl 0 &
           
           LLAMA_PID=$!
           echo "Server PID: $LLAMA_PID"
