@@ -63,15 +63,11 @@ jobs:
           cd llama.cpp
           mkdir -p models
           
-          echo "Installing huggingface-hub..."
-          pip install -q huggingface-hub
-          
           echo "Downloading Devstral-Small-2507-Q6_K.gguf (~19GB)..."
           echo "This will take several minutes..."
-          huggingface-cli download \
-            unsloth/Devstral-Small-2507-GGUF \
-            Devstral-Small-2507-Q6_K.gguf \
-            --local-dir ./models
+          
+          wget -O models/Devstral-Small-2507-Q6_K.gguf \
+            "https://huggingface.co/unsloth/Devstral-Small-2507-GGUF/resolve/main/Devstral-Small-2507-Q6_K.gguf"
           
           echo "Download complete."
           ls -lh models/
