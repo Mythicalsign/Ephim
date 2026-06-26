@@ -59,17 +59,31 @@ jobs:
           echo ""
 
       - name: Download Devstral model
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           cd llama.cpp
           mkdir -p models
           
           echo "Downloading Devstral-Small-2507-Q6_K.gguf (~19GB)..."
-          echo "This will take several minutes..."
+          echo "Started at: $(date)"
           
-          wget -O models/Devstral-Small-2507-Q6_K.gguf \
-            "https://huggingface.co/unsloth/Devstral-Small-2507-GGUF/resolve/main/Devstral-Small-2507-Q6_K.gguf"
+          if [ -n "$HF_TOKEN" ]; then
+            echo "Using authenticated download (faster)..."
+            wget --header="Authorization: Bearer $HF_TOKEN" \
+                 --progress=dot:giga \
+                 -O models/Devstral-Small-2507-Q6_K.gguf \
+                 "https://huggingface.co/unsloth/Devstral-Small-2507-GGUF/resolve/main/Devstral-Small-2507-Q6_K.gguf"
+          else
+            echo "WARNING: No HF_TOKEN found. Anonymous downloads are heavily throttled."
+            echo "This may take 5+ hours. Add HF_TOKEN secret for faster download."
+            wget --progress=dot:giga \
+                 -O models/Devstral-Small-2507-Q6_K.gguf \
+                 "https://huggingface.co/unsloth/Devstral-Small-2507-GGUF/resolve/main/Devstral-Small-2507-Q6_K.gguf"
+          fi
           
-          echo "Download complete."
+          echo ""
+          echo "Download finished at: $(date)"
           ls -lh models/
 
       - name: Verify workers are reachable
