@@ -22,7 +22,7 @@ jobs:
 
       - name: Connect to Tailscale
         env:
-          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH }}
         run: |
           # Start tailscaled
           sudo tailscaled --tun=userspace-networking --socks5-server=localhost:1055 --outbound-http-proxy-listen=localhost:1055 &
