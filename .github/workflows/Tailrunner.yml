@@ -7,10 +7,6 @@ on:
         description: 'How long to keep the runner alive (minutes)'
         required: true
         default: '60'
-      tags:
-        description: 'Tailscale tags (comma-separated, e.g. tag:ci,tag:runner)'
-        required: false
-        default: 'tag:ci-runner'
 
 jobs:
   tailscale-runner:
@@ -37,7 +33,6 @@ jobs:
             --authkey=${TS_AUTHKEY} \
             --hostname=github-runner-${GITHUB_RUN_ID} \
             --accept-routes \
-            --advertise-tags=${{ github.event.inputs.tags }} \
             --ssh
 
           # Wait for connection
@@ -66,7 +61,7 @@ jobs:
           echo "      Use key auth or sudo without password."
           echo "=========================================="
 
-      - name: Setup SSH server (optional but recommended)
+      - name: Setup SSH server
         run: |
           sudo apt-get update
           sudo apt-get install -y openssh-server
@@ -78,7 +73,7 @@ jobs:
           # Start SSH
           sudo service ssh start
 
-          echo "SSH server is also available on port 22 via Tailscale IP"
+          echo "SSH server is available on port 22 via Tailscale IP"
 
       - name: Keep runner alive
         run: |
