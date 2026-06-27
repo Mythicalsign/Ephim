@@ -44,9 +44,9 @@ on:
         required: false
         type: string
       duration_minutes:
-        description: 'How long to keep the runner alive (minutes)'
+        description: 'How long to keep the server alive (minutes)'
         required: true
-        default: '60'
+        default: '300'
 
 jobs:
   main-server:
@@ -57,6 +57,10 @@ jobs:
     env:
       RPC_PORT: "50052"
       SERVER_PORT: "8080"
+      API_KEY: "sk-local-llama"
+      MODEL_REPO: "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF"
+      MODEL_FILE: "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"
+      MODEL_DIR: "/home/runner/models"
 
     steps:
       - name: Install system dependencies
@@ -64,7 +68,19 @@ jobs:
         run: |
           set -euxo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends             build-essential             cmake             ninja-build             git             curl             wget             jq             python3             python3-pip             iproute2             netcat-openbsd             ca-certificates             openssh-server
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            ninja-build \
+            git \
+            curl \
+            wget \
+            jq \
+            python3 \
+            python3-pip \
+            iproute2 \
+            netcat-openbsd \
+            ca-certificates
 
       - name: Build llama.cpp with RPC support
         shell: bash
@@ -81,18 +97,13 @@ jobs:
           set -euxo pipefail
           cd llama.cpp
           ls -la build/bin/
-          if [ ! -x ./build/bin/llama-server ]; then
-            echo "Could not find llama-server binary"
-            exit 1
-          fi
-          if [ ! -x ./build/bin/ggml-rpc-server ]; then
-            echo "Could not find ggml-rpc-server binary"
-            exit 1
-          fi
-          if [ ! -x ./build/bin/llama-gguf-split ]; then
-            echo "Could not find llama-gguf-split binary"
-            exit 1
-          fi
+          for bin in llama-server ggml-rpc-server; do
+            if [ ! -x "./build/bin/$bin" ]; then
+              echo "Could not find $bin binary"
+              exit 1
+            fi
+          done
+          echo "LLAMA_BIN=$(pwd)/build/bin" >> "$GITHUB_ENV"
 
       - name: Install Tailscale
         shell: bash
@@ -104,7 +115,10 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          sudo tailscale up             --authkey "${{ secrets.TAILSCALE_AUTHKEY }}"             --hostname="llama-main-${{ github.run_id }}"             --accept-routes
+          sudo tailscale up \
+            --authkey "${{ secrets.TAILSCALE_AUTHKEY }}" \
+            --hostname="llama-main-${{ github.run_id }}" \
+            --accept-routes
 
           for i in {1..30}; do
             MAIN_IP="$(tailscale ip -4 2>/dev/null || true)"
@@ -194,69 +208,150 @@ jobs:
             check_worker "$ip"
           done
 
-      - name: Setup SSH server
+      - name: Install huggingface-hub CLI
+        shell: bash
+        run: |
+          set -euxo pipefail
+          pip install --break-system-packages huggingface_hub hf_transfer
+          echo "HF_HUB_ENABLE_HF_TRANSFER=1" >> "$GITHUB_ENV"
+
+      - name: Download model from HuggingFace
+        shell: bash
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          set -euxo pipefail
+          mkdir -p "$MODEL_DIR"
+
+          echo "Downloading $MODEL_FILE from $MODEL_REPO ..."
+          huggingface-cli download "$MODEL_REPO" "$MODEL_FILE" \
+            --local-dir "$MODEL_DIR" \
+            --token "$HF_TOKEN"
+
+          MODEL_PATH="$MODEL_DIR/$MODEL_FILE"
+
+          if [ ! -f "$MODEL_PATH" ]; then
+            echo "Model file not found at $MODEL_PATH after download"
+            ls -la "$MODEL_DIR/"
+            exit 1
+          fi
+
+          echo "Model downloaded: $(du -sh "$MODEL_PATH" | cut -f1)"
+          echo "MODEL_PATH=$MODEL_PATH" >> "$GITHUB_ENV"
+
+      - name: Start llama-server with RPC workers
         shell: bash
         run: |
           set -euxo pipefail
 
-          # Enable passwordless sudo for runner user
-          echo "runner ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/runner-nopasswd
-          sudo chmod 440 /etc/sudoers.d/runner-nopasswd
+          echo "Starting llama-server..."
+          echo "  Model:     $MODEL_PATH"
+          echo "  RPC nodes: $ACTIVE_WORKER_ENDPOINTS"
+          echo "  Port:      $SERVER_PORT"
 
-          # Start SSH
-          sudo service ssh start
+          nohup "$LLAMA_BIN/llama-server" \
+            -m "$MODEL_PATH" \
+            --rpc "$ACTIVE_WORKER_ENDPOINTS" \
+            -c 32768 \
+            -np 1 \
+            --host 0.0.0.0 \
+            --port "$SERVER_PORT" \
+            --api-key "$API_KEY" \
+            --jinja \
+            --no-webui \
+            -ngl 0 \
+            > /tmp/llama-server.log 2>&1 &
 
-          echo "SSH server is available on port 22 via Tailscale IP"
+          SERVER_PID=$!
+          echo "SERVER_PID=$SERVER_PID" >> "$GITHUB_ENV"
+          echo "llama-server PID: $SERVER_PID"
+
+          echo "Waiting for server to become ready..."
+          for i in {1..120}; do
+            if curl -sf \
+                -H "Authorization: Bearer $API_KEY" \
+                "http://localhost:$SERVER_PORT/v1/models" \
+                > /dev/null 2>&1; then
+              echo "Server is ready after $i attempts"
+              break
+            fi
+            if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+              echo "llama-server exited unexpectedly:"
+              cat /tmp/llama-server.log || true
+              exit 1
+            fi
+            sleep 5
+          done
+
+          if ! curl -sf \
+              -H "Authorization: Bearer $API_KEY" \
+              "http://localhost:$SERVER_PORT/v1/models" \
+              > /dev/null 2>&1; then
+            echo "Server never became ready. Last log:"
+            cat /tmp/llama-server.log || true
+            exit 1
+          fi
 
       - name: Display connection info
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           echo ""
           echo "========================================"
-          echo "  LLAMA MAIN SERVER IS READY"
+          echo "  LLAMA SERVER IS LIVE"
           echo ""
-          echo "  Tailscale IP: $MAIN_IP"
-          echo "  Hostname:     llama-main-${{ github.run_id }}"
+          echo "  Model:         $MODEL_FILE"
+          echo "  Workers:       $ACTIVE_WORKER_COUNT nodes"
+          echo "  Endpoints:     $ACTIVE_WORKER_ENDPOINTS"
           echo ""
-          echo "  llama.cpp location: ~/work/llama.cpp/llama.cpp"
-          echo "  Binaries:           ~/work/llama.cpp/llama.cpp/build/bin/"
+          echo "  Tailscale IP:  $MAIN_IP"
+          echo "  Base URL:      http://$MAIN_IP:$SERVER_PORT/v1"
+          echo "  API Key:       $API_KEY"
           echo ""
-          echo "  Active workers: $ACTIVE_WORKER_COUNT"
-          echo "  Worker endpoints: $ACTIVE_WORKER_ENDPOINTS"
+          echo "  Cline settings:"
+          echo "    Provider:    OpenAI Compatible"
+          echo "    Base URL:    http://$MAIN_IP:$SERVER_PORT/v1"
+          echo "    API Key:     $API_KEY"
+          echo "    Model ID:    $MODEL_FILE"
           echo ""
-          echo "  SSH into the runner:"
-          echo "    tailscale ssh runner@$MAIN_IP"
-          echo ""
-          echo "  Or use hostname:"
-          echo "    tailscale ssh runner@llama-main-${{ github.run_id }}"
-          echo ""
-          echo "  The 'runner' user password is empty."
-          echo "  Use key auth or sudo without password."
-          echo ""
-          echo "  To start the server manually, SSH in and run:"
-          echo "    cd ~/work/llama.cpp/llama.cpp"
-          echo "    ./build/bin/llama-server -m /path/to/model.gguf \\"
-          echo "      --rpc $ACTIVE_WORKER_ENDPOINTS \\"
-          echo "      -c 32768 -np 1 --host 0.0.0.0 --port 8080 \\"
-          echo "      --api-key sk-local-llama --jinja --no-webui -ngl 0"
-          echo ""
-          echo "  To start a local RPC worker on this machine:"
-          echo "    ./build/bin/ggml-rpc-server -H 0.0.0.0 -p 50052"
+          echo "  Health check:"
+          echo "    curl -H \"Authorization: Bearer $API_KEY\" \\"
+          echo "         http://$MAIN_IP:$SERVER_PORT/v1/models"
           echo "========================================"
           echo ""
 
-      - name: Keep runner alive
+      - name: Keep server alive and monitor health
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           DURATION=${{ github.event.inputs.duration_minutes }}
-          echo "Keeping runner alive for ${DURATION} minutes..."
-          echo "Cancel this workflow to terminate the runner early."
+          echo "Server will run for up to ${DURATION} minutes."
+          echo "Cancel this workflow run to shut it down early."
+          echo ""
 
-          for ((i=0; i<DURATION*60; i++)); do
-            sleep 1
+          END_TIME=$((SECONDS + DURATION * 60))
+          TICK=0
+
+          while [ "$SECONDS" -lt "$END_TIME" ]; do
+            sleep 30
+            TICK=$((TICK + 1))
+
+            if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+              echo "llama-server stopped unexpectedly. Last log:"
+              tail -n 40 /tmp/llama-server.log || true
+              exit 1
+            fi
+
+            # Log a heartbeat every 10 minutes
+            if [ $((TICK % 20)) -eq 0 ]; then
+              REMAINING=$(( (END_TIME - SECONDS) / 60 ))
+              echo "[ $(date -u '+%H:%M:%S') ] Server healthy. ~${REMAINING}m remaining."
+              echo "  Base URL: http://$MAIN_IP:$SERVER_PORT/v1"
+              echo "  API Key:  $API_KEY"
+            fi
           done
+
+          echo "Duration reached. Shutting down gracefully."
 
       - name: Cleanup on exit
         if: always()
@@ -264,4 +359,6 @@ jobs:
         run: |
           set +e
           echo "Shutting down..."
+          kill "$SERVER_PID" 2>/dev/null || true
+          pkill -f 'llama-server' || true
           sudo tailscale down || true
