@@ -1,4 +1,4 @@
-name: LLaMA Worker 1
+name: LLaMA Worker 9
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ jobs:
     permissions:
       contents: read
     env:
-      WORKER_ID: "1"
+      WORKER_ID: "9"
       RPC_PORT: "50052"
       KEEPALIVE_SECONDS: "21540"
       LLAMA_CACHE: /tmp/llama-rpc-cache
@@ -70,7 +70,7 @@ jobs:
           set -euxo pipefail
           sudo tailscale up \
             --authkey "${{ secrets.TAILSCALE_AUTHKEY }}" \
-            --hostname="llama-worker1-${{ github.run_id }}" \
+            --hostname="llama-worker9-${{ github.run_id }}" \
             --accept-routes
 
           for i in {1..30}; do

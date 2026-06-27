@@ -3,21 +3,61 @@ name: LLaMA Main Server
 on:
   workflow_dispatch:
     inputs:
+      model_choice:
+        description: 'Model to download and serve'
+        required: true
+        type: choice
+        options:
+          - Devstral-Small-2505-Q4_K_M
+          - Qwen3-Coder-Next-Q4_K_M
+        default: Devstral-Small-2505-Q4_K_M
       worker1_ip:
-        description: 'Worker 1 Tailscale IP (e.g. 100.x.x.x)'
+        description: 'Worker 1 Tailscale IP (required)'
         required: true
         type: string
       worker2_ip:
-        description: 'Worker 2 Tailscale IP (e.g. 100.x.x.x)'
+        description: 'Worker 2 Tailscale IP (required)'
         required: true
+        type: string
+      worker3_ip:
+        description: 'Worker 3 Tailscale IP (required)'
+        required: true
+        type: string
+      worker4_ip:
+        description: 'Worker 4 Tailscale IP (optional)'
+        required: false
+        type: string
+      worker5_ip:
+        description: 'Worker 5 Tailscale IP (optional)'
+        required: false
+        type: string
+      worker6_ip:
+        description: 'Worker 6 Tailscale IP (optional)'
+        required: false
+        type: string
+      worker7_ip:
+        description: 'Worker 7 Tailscale IP (optional)'
+        required: false
+        type: string
+      worker8_ip:
+        description: 'Worker 8 Tailscale IP (optional)'
+        required: false
+        type: string
+      worker9_ip:
+        description: 'Worker 9 Tailscale IP (optional)'
+        required: false
+        type: string
+      worker10_ip:
+        description: 'Worker 10 Tailscale IP (optional)'
+        required: false
         type: string
       api_key:
         description: 'API key for securing the server'
         required: true
         type: string
-        default: 'sk-devstral-local'
+        default: 'sk-local-llama'
       ctx_size:
-        description: 'Context size (keep at 32768 unless you know you have more RAM)'
+        description: 'Context size (32768 is a safe default for GitHub-hosted runners)'
         required: true
         type: string
         default: '32768'
@@ -26,22 +66,47 @@ jobs:
   main-server:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    permissions:
+      contents: read
+    env:
+      RPC_PORT: "50052"
+      SERVER_PORT: "8080"
+      KEEPALIVE_SECONDS: "21540"
 
     steps:
-      - name: Install build dependencies
+      - name: Install system dependencies
+        shell: bash
         run: |
+          set -euxo pipefail
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake git wget curl iproute2 netcat-openbsd
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            ninja-build \
+            git \
+            curl \
+            wget \
+            jq \
+            python3 \
+            python3-pip \
+            iproute2 \
+            netcat-openbsd \
+            ca-certificates
+          python3 -m pip install --upgrade "huggingface_hub[cli]"
 
       - name: Build llama.cpp with RPC support
+        shell: bash
         run: |
+          set -euxo pipefail
           git clone --depth 1 https://github.com/ggml-org/llama.cpp.git
           cd llama.cpp
-          cmake -B build -DGGML_RPC=ON -DCMAKE_BUILD_TYPE=Release
-          cmake --build build --config Release -j$(nproc)
+          cmake -S . -B build -G Ninja -DGGML_RPC=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel "$(nproc)"
 
       - name: Verify server binary exists
+        shell: bash
         run: |
+          set -euxo pipefail
           cd llama.cpp
           ls -la build/bin/
           if [ ! -x ./build/bin/llama-server ]; then
@@ -50,18 +115,22 @@ jobs:
           fi
 
       - name: Install Tailscale
+        shell: bash
         run: |
+          set -euxo pipefail
           curl -fsSL https://tailscale.com/install.sh | sh
 
       - name: Connect to Tailscale network
+        shell: bash
         run: |
+          set -euxo pipefail
           sudo tailscale up \
-            --authkey ${{ secrets.TAILSCALE_AUTHKEY }} \
-            --hostname=llama-main-${{ github.run_id }} \
+            --authkey "${{ secrets.TAILSCALE_AUTHKEY }}" \
+            --hostname="llama-main-${{ github.run_id }}" \
             --accept-routes
 
           for i in {1..30}; do
-            MAIN_IP=$(tailscale ip -4 2>/dev/null || true)
+            MAIN_IP="$(tailscale ip -4 2>/dev/null || true)"
             if [ -n "$MAIN_IP" ]; then
               echo "MAIN_IP=$MAIN_IP" >> "$GITHUB_ENV"
               exit 0
@@ -72,88 +141,192 @@ jobs:
           echo "Tailscale IPv4 was not assigned in time"
           exit 1
 
-      - name: Display main server Tailscale IP
+      - name: Collect and validate active workers
+        shell: bash
+        env:
+          WORKER1_IP: ${{ inputs.worker1_ip }}
+          WORKER2_IP: ${{ inputs.worker2_ip }}
+          WORKER3_IP: ${{ inputs.worker3_ip }}
+          WORKER4_IP: ${{ inputs.worker4_ip }}
+          WORKER5_IP: ${{ inputs.worker5_ip }}
+          WORKER6_IP: ${{ inputs.worker6_ip }}
+          WORKER7_IP: ${{ inputs.worker7_ip }}
+          WORKER8_IP: ${{ inputs.worker8_ip }}
+          WORKER9_IP: ${{ inputs.worker9_ip }}
+          WORKER10_IP: ${{ inputs.worker10_ip }}
         run: |
+          set -euo pipefail
+          ACTIVE_WORKERS=()
+          SEEN='|'
+
+          for idx in $(seq 1 10); do
+            var="WORKER${idx}_IP"
+            ip="${!var:-}"
+            if [ -z "$ip" ]; then
+              continue
+            fi
+            if [[ "$SEEN" == *"|$ip|"* ]]; then
+              echo "Duplicate worker IP detected: $ip"
+              exit 1
+            fi
+            ACTIVE_WORKERS+=("$ip")
+            SEEN="${SEEN}${ip}|"
+          done
+
+          if [ "${#ACTIVE_WORKERS[@]}" -lt 3 ]; then
+            echo "This workflow requires at least 3 worker IPs."
+            exit 1
+          fi
+
+          ACTIVE_ENDPOINTS=()
+          for ip in "${ACTIVE_WORKERS[@]}"; do
+            ACTIVE_ENDPOINTS+=("${ip}:${RPC_PORT}")
+          done
+
+          ACTIVE_WORKER_IPS_JOINED="$(IFS=,; echo "${ACTIVE_WORKERS[*]}")"
+          ACTIVE_WORKER_ENDPOINTS_JOINED="$(IFS=,; echo "${ACTIVE_ENDPOINTS[*]}")"
+
+          {
+            echo "ACTIVE_WORKER_COUNT=${#ACTIVE_WORKERS[@]}"
+            echo "ACTIVE_WORKER_IPS=$ACTIVE_WORKER_IPS_JOINED"
+            echo "ACTIVE_WORKER_ENDPOINTS=$ACTIVE_WORKER_ENDPOINTS_JOINED"
+          } >> "$GITHUB_ENV"
+
+      - name: Display main server Tailscale IP
+        shell: bash
+        run: |
+          set -euo pipefail
           echo ""
           echo "========================================"
           echo "  MAIN SERVER TAILSCALE IP"
           echo "  $MAIN_IP"
+          echo "  Active workers: $ACTIVE_WORKER_COUNT"
           echo "========================================"
           echo ""
 
-      - name: Download Devstral model
+      - name: Select model configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ inputs.model_choice }}" in
+            Devstral-Small-2505-Q4_K_M)
+              {
+                echo "MODEL_REPO=mistralai/Devstral-Small-2505_gguf"
+                echo "MODEL_INCLUDE=devstralQ4_K_M.gguf"
+                echo "MODEL_LOCAL_DIR=models/devstral"
+                echo "MODEL_LABEL=Devstral Small 2505 Q4_K_M"
+                echo "MODEL_API_NAME=devstral-small-2505"
+              } >> "$GITHUB_ENV"
+              ;;
+            Qwen3-Coder-Next-Q4_K_M)
+              {
+                echo "MODEL_REPO=Qwen/Qwen3-Coder-Next-GGUF"
+                echo "MODEL_INCLUDE=Qwen3-Coder-Next-Q4_K_M/*"
+                echo "MODEL_LOCAL_DIR=models/qwen3-coder-next-q4-k-m"
+                echo "MODEL_LABEL=Qwen3-Coder-Next Q4_K_M"
+                echo "MODEL_API_NAME=Qwen3-Coder-Next"
+              } >> "$GITHUB_ENV"
+              ;;
+            *)
+              echo "Unsupported model selection: ${{ inputs.model_choice }}"
+              exit 1
+              ;;
+          esac
+
+      - name: Download selected model
+        shell: bash
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
+          set -euxo pipefail
           cd llama.cpp
-          mkdir -p models
+          mkdir -p "$MODEL_LOCAL_DIR"
 
-          echo "Downloading Devstral-Small-2507-Q6_K.gguf (~19GB)..."
-          echo "Started at: $(date)"
-
-          if [ -n "$HF_TOKEN" ]; then
-            echo "Using authenticated download..."
-            wget --header="Authorization: Bearer $HF_TOKEN" \
-                 --progress=dot:giga \
-                 -O models/Devstral-Small-2507-Q6_K.gguf \
-                 "https://huggingface.co/unsloth/Devstral-Small-2507-GGUF/resolve/main/Devstral-Small-2507-Q6_K.gguf"
+          HF_ARGS=()
+          if [ -n "${HF_TOKEN:-}" ]; then
+            HF_ARGS+=(--token "$HF_TOKEN")
           else
             echo "WARNING: No HF_TOKEN found. Anonymous downloads may be throttled."
-            wget --progress=dot:giga \
-                 -O models/Devstral-Small-2507-Q6_K.gguf \
-                 "https://huggingface.co/unsloth/Devstral-Small-2507-GGUF/resolve/main/Devstral-Small-2507-Q6_K.gguf"
           fi
 
+          huggingface-cli download \
+            "$MODEL_REPO" \
+            --include "$MODEL_INCLUDE" \
+            --local-dir "$MODEL_LOCAL_DIR" \
+            "${HF_ARGS[@]}"
+
+          MODEL_FILE="$(find "$MODEL_LOCAL_DIR" -type f -name '*.gguf' | sort | head -n 1)"
+          if [ -z "$MODEL_FILE" ]; then
+            echo "No GGUF model file was downloaded."
+            exit 1
+          fi
+
+          echo "MODEL_FILE=$MODEL_FILE" >> "$GITHUB_ENV"
+
           echo ""
-          echo "Download finished at: $(date)"
-          ls -lh models/
+          echo "Downloaded model files:"
+          find "$MODEL_LOCAL_DIR" -maxdepth 2 -type f -name '*.gguf' -print | sort
+          echo ""
+          ls -lh "$MODEL_LOCAL_DIR"
 
       - name: Verify workers are reachable on RPC port
+        shell: bash
         run: |
+          set -euo pipefail
+          IFS=',' read -r -a WORKERS <<< "$ACTIVE_WORKER_IPS"
+
           check_worker() {
             local ip="$1"
-            echo "Checking $ip:50052 ..."
+            echo "Checking ${ip}:${RPC_PORT} ..."
             for i in {1..60}; do
-              if nc -z -w 2 "$ip" 50052; then
-                echo "$ip:50052 is reachable"
+              if nc -z -w 2 "$ip" "$RPC_PORT"; then
+                echo "${ip}:${RPC_PORT} is reachable"
                 return 0
               fi
               sleep 5
             done
-            echo "Timed out waiting for $ip:50052"
+            echo "Timed out waiting for ${ip}:${RPC_PORT}"
             return 1
           }
 
-          check_worker "${{ inputs.worker1_ip }}"
-          check_worker "${{ inputs.worker2_ip }}"
+          for ip in "${WORKERS[@]}"; do
+            check_worker "$ip"
+          done
 
       - name: Start llama server with RPC and wait for health
+        shell: bash
         run: |
+          set -euxo pipefail
           cd llama.cpp
+
+          SERVER_THREADS=$(( $(nproc) > 2 ? $(nproc) - 2 : 1 ))
 
           echo ""
           echo "========================================"
           echo "  STARTING LLAMA SERVER"
-          echo "  Model: Devstral-Small-2507-Q6_K.gguf"
-          echo "  Workers: ${{ inputs.worker1_ip }}:50052, ${{ inputs.worker2_ip }}:50052"
+          echo "  Model: $MODEL_LABEL"
+          echo "  Model file: $MODEL_FILE"
+          echo "  Workers: $ACTIVE_WORKER_ENDPOINTS"
+          echo "  Worker count: $ACTIVE_WORKER_COUNT"
           echo "  API Key: ${{ inputs.api_key }}"
           echo "  Context: ${{ inputs.ctx_size }}"
           echo "  Parallel slots: 1"
+          echo "  Distribution: automatic across active devices by available memory"
           echo "========================================"
           echo ""
 
           nohup ./build/bin/llama-server \
-            -m models/Devstral-Small-2507-Q6_K.gguf \
-            --rpc ${{ inputs.worker1_ip }}:50052,${{ inputs.worker2_ip }}:50052 \
-            -c ${{ inputs.ctx_size }} \
+            -m "$MODEL_FILE" \
+            --rpc "$ACTIVE_WORKER_ENDPOINTS" \
+            -c "${{ inputs.ctx_size }}" \
             -np 1 \
             --cache-type-k q8_0 \
             --cache-type-v q8_0 \
             --cache-ram 0 \
-            --threads $(nproc) \
-            --threads-batch $(nproc) \
+            --threads "$SERVER_THREADS" \
+            --threads-batch "$SERVER_THREADS" \
             --host 0.0.0.0 \
-            --port 8080 \
+            --port "$SERVER_PORT" \
             --api-key "${{ inputs.api_key }}" \
             --jinja \
             --no-webui \
@@ -164,7 +337,7 @@ jobs:
 
           echo "Waiting for server health endpoint..."
           for i in {1..120}; do
-            if curl -fsS http://127.0.0.1:8080/health >/tmp/llama-health.json; then
+            if curl -fsS "http://127.0.0.1:${SERVER_PORT}/health" >/tmp/llama-health.json; then
               echo "Server health check succeeded"
               break
             fi
@@ -176,7 +349,7 @@ jobs:
             sleep 5
           done
 
-          if ! curl -fsS http://127.0.0.1:8080/health >/tmp/llama-health.json; then
+          if ! curl -fsS "http://127.0.0.1:${SERVER_PORT}/health" >/tmp/llama-health.json; then
             echo "Server never became healthy"
             cat /tmp/llama-server.log || true
             exit 1
@@ -189,26 +362,33 @@ jobs:
           echo "========================================"
           echo "  SERVER IS RUNNING"
           echo ""
-          echo "  API Endpoint: http://$MAIN_IP:8080"
-          echo "  Health Check: http://$MAIN_IP:8080/health"
+          echo "  API Endpoint: http://$MAIN_IP:${SERVER_PORT}"
+          echo "  Health Check: http://$MAIN_IP:${SERVER_PORT}/health"
           echo ""
-          echo "  Configure Cline with:"
-          echo "  Base URL: http://$MAIN_IP:8080/v1"
+          echo "  Configure your OpenAI-compatible client with:"
+          echo "  Base URL: http://$MAIN_IP:${SERVER_PORT}/v1"
           echo "  API Key: ${{ inputs.api_key }}"
-          echo "  Model: devstral-small-2507"
+          echo "  Model: $MODEL_API_NAME"
           echo ""
-          echo "  Test with:"
-          echo "  curl http://$MAIN_IP:8080/v1/models \\\n            -H \"Authorization: Bearer ${{ inputs.api_key }}\""
-          echo ""
-          echo "  This server will run for ~6 hours"
+          echo "  This server will run for roughly 6 hours"
           echo "========================================"
           echo ""
 
-          sleep 21540
+          END_TIME=$((SECONDS + KEEPALIVE_SECONDS))
+          while [ "$SECONDS" -lt "$END_TIME" ]; do
+            if ! kill -0 "$LLAMA_PID" 2>/dev/null; then
+              echo "llama-server stopped unexpectedly"
+              cat /tmp/llama-server.log || true
+              exit 1
+            fi
+            sleep 30
+          done
 
       - name: Cleanup on exit
         if: always()
+        shell: bash
         run: |
+          set +e
           echo "Shutting down server..."
           pkill -f llama-server || true
           sudo tailscale down || true
