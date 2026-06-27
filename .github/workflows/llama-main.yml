@@ -208,12 +208,12 @@ jobs:
             check_worker "$ip"
           done
 
-      - name: Install huggingface-hub CLI
+      - name: Install hf CLI
         shell: bash
         run: |
           set -euxo pipefail
-          pip install --break-system-packages huggingface_hub hf_transfer
-          echo "HF_HUB_ENABLE_HF_TRANSFER=1" >> "$GITHUB_ENV"
+          pip install --break-system-packages "huggingface_hub[hf_xet]"
+          echo "HF_XET_HIGH_PERFORMANCE=1" >> "$GITHUB_ENV"
 
       - name: Download model from HuggingFace
         shell: bash
@@ -224,7 +224,7 @@ jobs:
           mkdir -p "$MODEL_DIR"
 
           echo "Downloading $MODEL_FILE from $MODEL_REPO ..."
-          huggingface-cli download "$MODEL_REPO" "$MODEL_FILE" \
+          hf download "$MODEL_REPO" "$MODEL_FILE" \
             --local-dir "$MODEL_DIR" \
             --token "$HF_TOKEN"
 
