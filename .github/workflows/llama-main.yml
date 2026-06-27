@@ -79,20 +79,7 @@ jobs:
         run: |
           set -euxo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential \
-            cmake \
-            ninja-build \
-            git \
-            curl \
-            wget \
-            jq \
-            python3 \
-            python3-pip \
-            iproute2 \
-            netcat-openbsd \
-            ca-certificates
-          python3 -m pip install --upgrade "huggingface_hub[cli]"
+          sudo apt-get install -y --no-install-recommends             build-essential             cmake             ninja-build             git             curl             wget             jq             python3             python3-pip             iproute2             netcat-openbsd             ca-certificates
 
       - name: Build llama.cpp with RPC support
         shell: bash
@@ -124,10 +111,7 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          sudo tailscale up \
-            --authkey "${{ secrets.TAILSCALE_AUTHKEY }}" \
-            --hostname="llama-main-${{ github.run_id }}" \
-            --accept-routes
+          sudo tailscale up             --authkey "${{ secrets.TAILSCALE_AUTHKEY }}"             --hostname="llama-main-${{ github.run_id }}"             --accept-routes
 
           for i in {1..30}; do
             MAIN_IP="$(tailscale ip -4 2>/dev/null || true)"
@@ -233,26 +217,34 @@ jobs:
               ;;
           esac
 
-            - name: Download selected model
+      - name: Download selected model
         shell: bash
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-    run: |
+        run: |
           set -euxo pipefail
           cd llama.cpp
           mkdir -p "$MODEL_LOCAL_DIR"
 
-          # Authenticate with hf CLI
-          if [ -n "${HF_TOKEN:-}" ]; then
-            echo "$HF_TOKEN" | hf auth login --token-stdin
-          else
-            echo "WARNING: No HF_TOKEN found. Anonymous downloads may be throttled."
-          fi
+          python3 -m pip install --upgrade huggingface_hub
 
-          # Download using hf CLI
-          hf download "$MODEL_REPO" \
-            --include "$MODEL_INCLUDE" \
-            --local-dir "$MODEL_LOCAL_DIR"
+          python3 << 'PYEOF'
+          import os
+          from huggingface_hub import snapshot_download
+
+          repo = os.environ["MODEL_REPO"]
+          include = os.environ["MODEL_INCLUDE"]
+          local_dir = os.environ["MODEL_LOCAL_DIR"]
+          token = os.environ.get("HF_TOKEN")
+
+          snapshot_download(
+              repo_id=repo,
+              allow_patterns=include,
+              local_dir=local_dir,
+              token=token,
+              local_dir_use_symlinks=False
+          )
+          PYEOF
 
           MODEL_FILE="$(find "$MODEL_LOCAL_DIR" -type f -name '*.gguf' | sort | head -n 1)"
           if [ -z "$MODEL_FILE" ]; then
@@ -314,22 +306,7 @@ jobs:
           echo "========================================"
           echo ""
 
-          nohup ./build/bin/llama-server \
-            -m "$MODEL_FILE" \
-            --rpc "$ACTIVE_WORKER_ENDPOINTS" \
-            -c "${{ inputs.ctx_size }}" \
-            -np 1 \
-            --cache-type-k q8_0 \
-            --cache-type-v q8_0 \
-            --cache-ram 0 \
-            --threads "$SERVER_THREADS" \
-            --threads-batch "$SERVER_THREADS" \
-            --host 0.0.0.0 \
-            --port "$SERVER_PORT" \
-            --api-key "${{ inputs.api_key }}" \
-            --jinja \
-            --no-webui \
-            -ngl 0 > /tmp/llama-server.log 2>&1 &
+          nohup ./build/bin/llama-server             -m "$MODEL_FILE"             --rpc "$ACTIVE_WORKER_ENDPOINTS"             -c "${{ inputs.ctx_size }}"             -np 1             --cache-type-k q8_0             --cache-type-v q8_0             --cache-ram 0             --threads "$SERVER_THREADS"             --threads-batch "$SERVER_THREADS"             --host 0.0.0.0             --port "$SERVER_PORT"             --api-key "${{ inputs.api_key }}"             --jinja             --no-webui             -ngl 0 > /tmp/llama-server.log 2>&1 &
 
           LLAMA_PID=$!
           echo "LLAMA_PID=$LLAMA_PID"
