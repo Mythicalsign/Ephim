@@ -217,7 +217,7 @@ jobs:
               ;;
           esac
 
-      - name: Download selected model
+      - name: Download and merge model shards
         shell: bash
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -246,19 +246,51 @@ jobs:
           )
           PYEOF
 
-          MODEL_FILE="$(find "$MODEL_LOCAL_DIR" -type f -name '*.gguf' | sort | head -n 1)"
-          if [ -z "$MODEL_FILE" ]; then
-            echo "No GGUF model file was downloaded."
+          echo ""
+          echo "Downloaded files:"
+          find "$MODEL_LOCAL_DIR" -type f | sort
+          echo ""
+
+          # Check if we have split shards
+          SHARD_COUNT=$(find "$MODEL_LOCAL_DIR" -name '*-of-*.gguf' | wc -l)
+
+          if [ "$SHARD_COUNT" -gt 0 ]; then
+            echo "Detected split GGUF shards ($SHARD_COUNT files). Merging..."
+
+            # Find the first shard to determine the base name
+            FIRST_SHARD=$(find "$MODEL_LOCAL_DIR" -name '*-of-*.gguf' | sort | head -n 1)
+            SHARD_DIR=$(dirname "$FIRST_SHARD")
+
+            # Extract base name (remove -00001-of-XXXXX.gguf suffix)
+            BASENAME=$(basename "$FIRST_SHARD" | sed 's/-[0-9]\+-of-[0-9]\+\.gguf$//')
+            MERGED_FILE="$SHARD_DIR/${BASENAME}.gguf"
+
+            echo "Merging shards into: $MERGED_FILE"
+            ./build/bin/llama-gguf-split --merge "$SHARD_DIR/${BASENAME}-00001-of-"*.gguf "$MERGED_FILE"
+
+            if [ ! -f "$MERGED_FILE" ]; then
+              echo "Merge failed!"
+              exit 1
+            fi
+
+            echo "Merge successful. Merged file size:"
+            ls -lh "$MERGED_FILE"
+
+            MODEL_FILE="$MERGED_FILE"
+          else
+            MODEL_FILE=$(find "$MODEL_LOCAL_DIR" -type f -name '*.gguf' | sort | head -n 1)
+          fi
+
+          if [ -z "$MODEL_FILE" ] || [ ! -f "$MODEL_FILE" ]; then
+            echo "No GGUF model file found."
             exit 1
           fi
 
           echo "MODEL_FILE=$MODEL_FILE" >> "$GITHUB_ENV"
 
           echo ""
-          echo "Downloaded model files:"
-          find "$MODEL_LOCAL_DIR" -maxdepth 2 -type f -name '*.gguf' -print | sort
-          echo ""
-          ls -lh "$MODEL_LOCAL_DIR"
+          echo "Final model file: $MODEL_FILE"
+          ls -lh "$MODEL_FILE"
 
       - name: Verify workers are reachable on RPC port
         shell: bash
@@ -302,55 +334,61 @@ jobs:
           echo "  API Key: ${{ inputs.api_key }}"
           echo "  Context: ${{ inputs.ctx_size }}"
           echo "  Parallel slots: 1"
-          echo "  Distribution: automatic across active devices by available memory"
           echo "========================================"
           echo ""
 
-          nohup ./build/bin/llama-server \
-            -m "$MODEL_FILE" \
-            --rpc "$ACTIVE_WORKER_ENDPOINTS" \
-            -c "${{ inputs.ctx_size }}" \
-            -np 1 \
-            --cache-type-k q8_0 \
-            --cache-type-v q8_0 \
-            --cache-ram 0 \
-            --threads "$SERVER_THREADS" \
-            --threads-batch "$SERVER_THREADS" \
-            --host 0.0.0.0 \
-            --port "$SERVER_PORT" \
-            --api-key "${{ inputs.api_key }}" \
-            --jinja \
-            --no-webui \
-            --no-repack \
-            -ngl 999 \
-            > /tmp/llama-server.log 2>&1 &
+          # Stream logs in background so we can see them
+          touch /tmp/llama-server.log
+          tail -f /tmp/llama-server.log &
+          TAIL_PID=$!
+
+          ./build/bin/llama-server             -m "$MODEL_FILE"             --rpc "$ACTIVE_WORKER_ENDPOINTS"             -c "${{ inputs.ctx_size }}"             -np 1             --split-mode layer             --cache-type-k q4_0             --cache-type-v q4_0             --threads "$SERVER_THREADS"             --threads-batch "$SERVER_THREADS"             --host 0.0.0.0             --port "$SERVER_PORT"             --api-key "${{ inputs.api_key }}"             --jinja             --no-webui             -ngl 0 > /tmp/llama-server.log 2>&1 &
 
           LLAMA_PID=$!
           echo "LLAMA_PID=$LLAMA_PID"
 
-          echo "Waiting for server health endpoint..."
-          for i in {1..120}; do
-            if curl -fsS "http://127.0.0.1:${SERVER_PORT}/health" >/tmp/llama-health.json; then
-              echo "Server health check succeeded"
-              break
-            fi
+          echo "Waiting for server to become ready..."
+          HEALTHY=0
+          for i in $(seq 1 180); do
             if ! kill -0 "$LLAMA_PID" 2>/dev/null; then
-              echo "llama-server exited early"
+              echo "llama-server exited early!"
+              kill $TAIL_PID 2>/dev/null || true
+              echo ""
+              echo "=== FULL SERVER LOG ==="
               cat /tmp/llama-server.log || true
+              echo "======================="
               exit 1
             fi
+
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${SERVER_PORT}/health" 2>/dev/null || echo "000")
+
+            if [ "$HTTP_STATUS" = "200" ]; then
+              echo "Server health check succeeded (HTTP 200)"
+              HEALTHY=1
+              break
+            elif [ "$HTTP_STATUS" = "503" ]; then
+              echo "Server still loading... (attempt $i/180, HTTP 503)"
+            else
+              echo "Waiting for server... (attempt $i/180, HTTP $HTTP_STATUS)"
+            fi
+
             sleep 5
           done
 
-          if ! curl -fsS "http://127.0.0.1:${SERVER_PORT}/health" >/tmp/llama-health.json; then
+          kill $TAIL_PID 2>/dev/null || true
+
+          if [ "$HEALTHY" != "1" ]; then
             echo "Server never became healthy"
+            echo ""
+            echo "=== FULL SERVER LOG ==="
             cat /tmp/llama-server.log || true
+            echo "======================="
             exit 1
           fi
 
           echo ""
-          echo "Last server log lines:"
-          tail -n 40 /tmp/llama-server.log || true
+          echo "Last 50 log lines:"
+          tail -n 50 /tmp/llama-server.log || true
           echo ""
           echo "========================================"
           echo "  SERVER IS RUNNING"
