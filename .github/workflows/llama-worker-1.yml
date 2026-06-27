@@ -12,14 +12,27 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake git
+          sudo apt-get install -y build-essential cmake git curl iproute2 netcat-openbsd
 
-      - name: Build llama.cpp
+      - name: Build llama.cpp with RPC support
         run: |
-          git clone https://github.com/ggerganov/llama.cpp.git
+          git clone --depth 1 https://github.com/ggml-org/llama.cpp.git
           cd llama.cpp
-          cmake -B build
+          cmake -B build -DGGML_RPC=ON -DCMAKE_BUILD_TYPE=Release
           cmake --build build --config Release -j$(nproc)
+
+      - name: Verify RPC binary exists
+        run: |
+          cd llama.cpp
+          ls -la build/bin/
+          if [ -x ./build/bin/rpc-server ]; then
+            echo "RPC_BIN=./build/bin/rpc-server" >> "$GITHUB_ENV"
+          elif [ -x ./build/bin/llama-rpc-server ]; then
+            echo "RPC_BIN=./build/bin/llama-rpc-server" >> "$GITHUB_ENV"
+          else
+            echo "Could not find rpc-server binary"
+            exit 1
+          fi
 
       - name: Install Tailscale
         run: |
@@ -32,11 +45,20 @@ jobs:
             --hostname=llama-worker1-${{ github.run_id }} \
             --accept-routes
 
+          for i in {1..30}; do
+            WORKER_IP=$(tailscale ip -4 2>/dev/null || true)
+            if [ -n "$WORKER_IP" ]; then
+              echo "WORKER_IP=$WORKER_IP" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "Tailscale IPv4 was not assigned in time"
+          exit 1
+
       - name: Display Tailscale IP
-        id: get-ip
         run: |
-          WORKER_IP=$(tailscale ip -4)
-          echo "WORKER_IP=$WORKER_IP" >> $GITHUB_OUTPUT
           echo ""
           echo "========================================"
           echo "  WORKER 1 IS READY"
@@ -45,12 +67,37 @@ jobs:
           echo "========================================"
           echo ""
 
-      - name: Start RPC server
+      - name: Start RPC server and verify port
         run: |
           cd llama.cpp
-          echo "Starting llama-rpc-server on port 50052..."
-          ./build/bin/llama-rpc-server -H 0.0.0.0 -p 50052 &
-          
+          echo "Starting RPC server on 0.0.0.0:50052 ..."
+          nohup "$RPC_BIN" -H 0.0.0.0 -p 50052 -t $(nproc) -c > /tmp/llama-rpc.log 2>&1 &
+          RPC_PID=$!
+          echo "RPC_PID=$RPC_PID"
+
+          for i in {1..30}; do
+            if ss -ltn | grep -q ':50052 '; then
+              echo "RPC server is listening on port 50052"
+              break
+            fi
+            if ! kill -0 "$RPC_PID" 2>/dev/null; then
+              echo "RPC server exited early"
+              cat /tmp/llama-rpc.log || true
+              exit 1
+            fi
+            sleep 2
+          done
+
+          if ! ss -ltn | grep -q ':50052 '; then
+            echo "RPC server never opened port 50052"
+            cat /tmp/llama-rpc.log || true
+            exit 1
+          fi
+
+          echo ""
+          echo "Last RPC log lines:"
+          tail -n 20 /tmp/llama-rpc.log || true
+          echo ""
           echo "RPC server running. Keeping alive for 6 hours..."
           sleep 21540
 
@@ -58,5 +105,5 @@ jobs:
         if: always()
         run: |
           echo "Shutting down..."
-          pkill -f llama-rpc-server || true
+          pkill -f 'rpc-server|llama-rpc-server' || true
           sudo tailscale down || true

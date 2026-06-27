@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       worker1_ip:
-        description: 'Worker 1 Tailscale IP (e.g., 100.x.x.x)'
+        description: 'Worker 1 Tailscale IP (e.g. 100.x.x.x)'
         required: true
         type: string
       worker2_ip:
-        description: 'Worker 2 Tailscale IP (e.g., 100.x.x.x)'
+        description: 'Worker 2 Tailscale IP (e.g. 100.x.x.x)'
         required: true
         type: string
       api_key:
@@ -16,6 +16,11 @@ on:
         required: true
         type: string
         default: 'sk-devstral-local'
+      ctx_size:
+        description: 'Context size (keep at 32768 unless you know you have more RAM)'
+        required: true
+        type: string
+        default: '32768'
 
 jobs:
   main-server:
@@ -26,19 +31,23 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake git wget
+          sudo apt-get install -y build-essential cmake git wget curl iproute2 netcat-openbsd
 
       - name: Build llama.cpp with RPC support
         run: |
-          git clone https://github.com/ggerganov/llama.cpp.git
+          git clone --depth 1 https://github.com/ggml-org/llama.cpp.git
           cd llama.cpp
-          cmake -B build -DGGML_RPC=ON
+          cmake -B build -DGGML_RPC=ON -DCMAKE_BUILD_TYPE=Release
           cmake --build build --config Release -j$(nproc)
 
-      - name: Verify RPC binary exists
+      - name: Verify server binary exists
         run: |
-          ls -la llama.cpp/build/bin/llama-server
-          llama.cpp/build/bin/llama-server --help | grep -i rpc || echo "RPC not enabled in build"
+          cd llama.cpp
+          ls -la build/bin/
+          if [ ! -x ./build/bin/llama-server ]; then
+            echo "Could not find llama-server binary"
+            exit 1
+          fi
 
       - name: Install Tailscale
         run: |
@@ -51,11 +60,20 @@ jobs:
             --hostname=llama-main-${{ github.run_id }} \
             --accept-routes
 
+          for i in {1..30}; do
+            MAIN_IP=$(tailscale ip -4 2>/dev/null || true)
+            if [ -n "$MAIN_IP" ]; then
+              echo "MAIN_IP=$MAIN_IP" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "Tailscale IPv4 was not assigned in time"
+          exit 1
+
       - name: Display main server Tailscale IP
-        id: get-ip
         run: |
-          MAIN_IP=$(tailscale ip -4)
-          echo "MAIN_IP=$MAIN_IP" >> $GITHUB_OUTPUT
           echo ""
           echo "========================================"
           echo "  MAIN SERVER TAILSCALE IP"
@@ -69,76 +87,104 @@ jobs:
         run: |
           cd llama.cpp
           mkdir -p models
-          
+
           echo "Downloading Devstral-Small-2507-Q6_K.gguf (~19GB)..."
           echo "Started at: $(date)"
-          
+
           if [ -n "$HF_TOKEN" ]; then
-            echo "Using authenticated download (faster)..."
+            echo "Using authenticated download..."
             wget --header="Authorization: Bearer $HF_TOKEN" \
                  --progress=dot:giga \
                  -O models/Devstral-Small-2507-Q6_K.gguf \
                  "https://huggingface.co/unsloth/Devstral-Small-2507-GGUF/resolve/main/Devstral-Small-2507-Q6_K.gguf"
           else
-            echo "WARNING: No HF_TOKEN found. Anonymous downloads are heavily throttled."
+            echo "WARNING: No HF_TOKEN found. Anonymous downloads may be throttled."
             wget --progress=dot:giga \
                  -O models/Devstral-Small-2507-Q6_K.gguf \
                  "https://huggingface.co/unsloth/Devstral-Small-2507-GGUF/resolve/main/Devstral-Small-2507-Q6_K.gguf"
           fi
-          
+
           echo ""
           echo "Download finished at: $(date)"
           ls -lh models/
 
-      - name: Verify workers are reachable
+      - name: Verify workers are reachable on RPC port
         run: |
-          echo "Pinging workers..."
-          echo "Worker 1: ${{ inputs.worker1_ip }}"
-          ping -c 3 ${{ inputs.worker1_ip }} || echo "Warning: Worker 1 may not be ready"
-          
-          echo ""
-          echo "Worker 2: ${{ inputs.worker2_ip }}"
-          ping -c 3 ${{ inputs.worker2_ip }} || echo "Warning: Worker 2 may not be ready"
-          
-          echo ""
-          echo "Waiting 10 seconds for any stragglers..."
-          sleep 10
+          check_worker() {
+            local ip="$1"
+            echo "Checking $ip:50052 ..."
+            for i in {1..60}; do
+              if nc -z -w 2 "$ip" 50052; then
+                echo "$ip:50052 is reachable"
+                return 0
+              fi
+              sleep 5
+            done
+            echo "Timed out waiting for $ip:50052"
+            return 1
+          }
 
-      - name: Start llama server with RPC
+          check_worker "${{ inputs.worker1_ip }}"
+          check_worker "${{ inputs.worker2_ip }}"
+
+      - name: Start llama server with RPC and wait for health
         run: |
           cd llama.cpp
-          
-          MAIN_IP=$(tailscale ip -4)
-          
+
           echo ""
           echo "========================================"
           echo "  STARTING LLAMA SERVER"
           echo "  Model: Devstral-Small-2507-Q6_K.gguf"
           echo "  Workers: ${{ inputs.worker1_ip }}:50052, ${{ inputs.worker2_ip }}:50052"
           echo "  API Key: ${{ inputs.api_key }}"
-          echo "  Context: 32768"
+          echo "  Context: ${{ inputs.ctx_size }}"
+          echo "  Parallel slots: 1"
           echo "========================================"
           echo ""
-          
-          ./build/bin/llama-server \
+
+          nohup ./build/bin/llama-server \
             -m models/Devstral-Small-2507-Q6_K.gguf \
             --rpc ${{ inputs.worker1_ip }}:50052,${{ inputs.worker2_ip }}:50052 \
-            -c 32768 \
+            -c ${{ inputs.ctx_size }} \
+            -np 1 \
             --cache-type-k q8_0 \
+            --cache-type-v q8_0 \
+            --cache-ram 0 \
+            --threads $(nproc) \
+            --threads-batch $(nproc) \
             --host 0.0.0.0 \
             --port 8080 \
             --api-key "${{ inputs.api_key }}" \
             --jinja \
-            --flash-attn on \
-            -ngl 0 &
-          
+            --no-webui \
+            -ngl 0 > /tmp/llama-server.log 2>&1 &
+
           LLAMA_PID=$!
-          echo "Server PID: $LLAMA_PID"
-          
+          echo "LLAMA_PID=$LLAMA_PID"
+
+          echo "Waiting for server health endpoint..."
+          for i in {1..120}; do
+            if curl -fsS http://127.0.0.1:8080/health >/tmp/llama-health.json; then
+              echo "Server health check succeeded"
+              break
+            fi
+            if ! kill -0 "$LLAMA_PID" 2>/dev/null; then
+              echo "llama-server exited early"
+              cat /tmp/llama-server.log || true
+              exit 1
+            fi
+            sleep 5
+          done
+
+          if ! curl -fsS http://127.0.0.1:8080/health >/tmp/llama-health.json; then
+            echo "Server never became healthy"
+            cat /tmp/llama-server.log || true
+            exit 1
+          fi
+
           echo ""
-          echo "Waiting for server to initialize..."
-          sleep 20
-          
+          echo "Last server log lines:"
+          tail -n 40 /tmp/llama-server.log || true
           echo ""
           echo "========================================"
           echo "  SERVER IS RUNNING"
@@ -152,13 +198,12 @@ jobs:
           echo "  Model: devstral-small-2507"
           echo ""
           echo "  Test with:"
-          echo "  curl http://$MAIN_IP:8080/v1/models \\"
-          echo "    -H \"Authorization: Bearer ${{ inputs.api_key }}\""
+          echo "  curl http://$MAIN_IP:8080/v1/models \\\n            -H \"Authorization: Bearer ${{ inputs.api_key }}\""
           echo ""
           echo "  This server will run for ~6 hours"
           echo "========================================"
           echo ""
-          
+
           sleep 21540
 
       - name: Cleanup on exit
