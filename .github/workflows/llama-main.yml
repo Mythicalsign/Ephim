@@ -1,425 +1,207 @@
-name: LLaMA Main Server
-
-on:
-  workflow_dispatch:
-    inputs:
-      model_choice:
-        description: 'Model to download and serve'
-        required: true
-        type: choice
-        options:
-          - Devstral-Small-2505-Q4_K_M
-          - Qwen3-Coder-Next-Q4_K_M
-        default: Devstral-Small-2505-Q4_K_M
-      worker1_ip:
-        description: 'Worker 1 Tailscale IP (required)'
-        required: true
-        type: string
-      worker2_ip:
-        description: 'Worker 2 Tailscale IP (required)'
-        required: true
-        type: string
-      worker3_ip:
-        description: 'Worker 3 Tailscale IP (required)'
-        required: true
-        type: string
-      worker4_ip:
-        description: 'Worker 4 Tailscale IP (optional)'
-        required: false
-        type: string
-      worker5_ip:
-        description: 'Worker 5 Tailscale IP (optional)'
-        required: false
-        type: string
-      worker6_ip:
-        description: 'Worker 6 Tailscale IP (optional)'
-        required: false
-        type: string
-      worker7_ip:
-        description: 'Worker 7 Tailscale IP (optional)'
-        required: false
-        type: string
-      worker8_ip:
-        description: 'Worker 8 Tailscale IP (optional)'
-        required: false
-        type: string
-      worker9_ip:
-        description: 'Worker 9 Tailscale IP (optional)'
-        required: false
-        type: string
-      worker10_ip:
-        description: 'Worker 10 Tailscale IP (optional)'
-        required: false
-        type: string
-      api_key:
-        description: 'API key for securing the server'
-        required: true
-        type: string
-        default: 'sk-local-llama'
-      ctx_size:
-        description: 'Context size (32768 is a safe default for GitHub-hosted runners)'
-        required: true
-        type: string
-        default: '32768'
-
-jobs:
-  main-server:
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
-    permissions:
-      contents: read
-    env:
-      RPC_PORT: "50052"
-      SERVER_PORT: "8080"
-      KEEPALIVE_SECONDS: "21540"
-
-    steps:
-      - name: Install system dependencies
-        shell: bash
-        run: |
-          set -euxo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends             build-essential             cmake             ninja-build             git             curl             wget             jq             python3             python3-pip             iproute2             netcat-openbsd             ca-certificates
-
-      - name: Build llama.cpp with RPC support
-        shell: bash
-        run: |
-          set -euxo pipefail
-          git clone --depth 1 https://github.com/ggml-org/llama.cpp.git
-          cd llama.cpp
-          cmake -S . -B build -G Ninja -DGGML_RPC=ON -DCMAKE_BUILD_TYPE=Release
-          cmake --build build --parallel "$(nproc)"
-
-      - name: Verify server binary exists
-        shell: bash
-        run: |
-          set -euxo pipefail
-          cd llama.cpp
-          ls -la build/bin/
-          if [ ! -x ./build/bin/llama-server ]; then
-            echo "Could not find llama-server binary"
-            exit 1
-          fi
-
-      - name: Install Tailscale
-        shell: bash
-        run: |
-          set -euxo pipefail
-          curl -fsSL https://tailscale.com/install.sh | sh
-
-      - name: Connect to Tailscale network
-        shell: bash
-        run: |
-          set -euxo pipefail
-          sudo tailscale up             --authkey "${{ secrets.TAILSCALE_AUTHKEY }}"             --hostname="llama-main-${{ github.run_id }}"             --accept-routes
-
-          for i in {1..30}; do
-            MAIN_IP="$(tailscale ip -4 2>/dev/null || true)"
-            if [ -n "$MAIN_IP" ]; then
-              echo "MAIN_IP=$MAIN_IP" >> "$GITHUB_ENV"
-              exit 0
-            fi
-            sleep 2
-          done
-
-          echo "Tailscale IPv4 was not assigned in time"
-          exit 1
-
-      - name: Collect and validate active workers
-        shell: bash
-        env:
-          WORKER1_IP: ${{ inputs.worker1_ip }}
-          WORKER2_IP: ${{ inputs.worker2_ip }}
-          WORKER3_IP: ${{ inputs.worker3_ip }}
-          WORKER4_IP: ${{ inputs.worker4_ip }}
-          WORKER5_IP: ${{ inputs.worker5_ip }}
-          WORKER6_IP: ${{ inputs.worker6_ip }}
-          WORKER7_IP: ${{ inputs.worker7_ip }}
-          WORKER8_IP: ${{ inputs.worker8_ip }}
-          WORKER9_IP: ${{ inputs.worker9_ip }}
-          WORKER10_IP: ${{ inputs.worker10_ip }}
-        run: |
-          set -euo pipefail
-          ACTIVE_WORKERS=()
-          SEEN='|'
-
-          for idx in $(seq 1 10); do
-            var="WORKER${idx}_IP"
-            ip="${!var:-}"
-            if [ -z "$ip" ]; then
-              continue
-            fi
-            if [[ "$SEEN" == *"|$ip|"* ]]; then
-              echo "Duplicate worker IP detected: $ip"
-              exit 1
-            fi
-            ACTIVE_WORKERS+=("$ip")
-            SEEN="${SEEN}${ip}|"
-          done
-
-          if [ "${#ACTIVE_WORKERS[@]}" -lt 3 ]; then
-            echo "This workflow requires at least 3 worker IPs."
-            exit 1
-          fi
-
-          ACTIVE_ENDPOINTS=()
-          for ip in "${ACTIVE_WORKERS[@]}"; do
-            ACTIVE_ENDPOINTS+=("${ip}:${RPC_PORT}")
-          done
-
-          ACTIVE_WORKER_IPS_JOINED="$(IFS=,; echo "${ACTIVE_WORKERS[*]}")"
-          ACTIVE_WORKER_ENDPOINTS_JOINED="$(IFS=,; echo "${ACTIVE_ENDPOINTS[*]}")"
-
-          {
-            echo "ACTIVE_WORKER_COUNT=${#ACTIVE_WORKERS[@]}"
-            echo "ACTIVE_WORKER_IPS=$ACTIVE_WORKER_IPS_JOINED"
-            echo "ACTIVE_WORKER_ENDPOINTS=$ACTIVE_WORKER_ENDPOINTS_JOINED"
-          } >> "$GITHUB_ENV"
-
-      - name: Display main server Tailscale IP
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo ""
-          echo "========================================"
-          echo "  MAIN SERVER TAILSCALE IP"
-          echo "  $MAIN_IP"
-          echo "  Active workers: $ACTIVE_WORKER_COUNT"
-          echo "========================================"
-          echo ""
-
-      - name: Select model configuration
-        shell: bash
-        run: |
-          set -euo pipefail
-          case "${{ inputs.model_choice }}" in
-            Devstral-Small-2505-Q4_K_M)
-              {
-                echo "MODEL_REPO=mistralai/Devstral-Small-2505_gguf"
-                echo "MODEL_INCLUDE=devstralQ4_K_M.gguf"
-                echo "MODEL_LOCAL_DIR=models/devstral"
-                echo "MODEL_LABEL=Devstral Small 2505 Q4_K_M"
-                echo "MODEL_API_NAME=devstral-small-2505"
-              } >> "$GITHUB_ENV"
-              ;;
-            Qwen3-Coder-Next-Q4_K_M)
-              {
-                echo "MODEL_REPO=Qwen/Qwen3-Coder-Next-GGUF"
-                echo "MODEL_INCLUDE=Qwen3-Coder-Next-Q4_K_M/*"
-                echo "MODEL_LOCAL_DIR=models/qwen3-coder-next-q4-k-m"
-                echo "MODEL_LABEL=Qwen3-Coder-Next Q4_K_M"
-                echo "MODEL_API_NAME=Qwen3-Coder-Next"
-              } >> "$GITHUB_ENV"
-              ;;
-            *)
-              echo "Unsupported model selection: ${{ inputs.model_choice }}"
-              exit 1
-              ;;
-          esac
-
-      - name: Download and merge model shards
-        shell: bash
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: |
-          set -euxo pipefail
-          cd llama.cpp
-          mkdir -p "$MODEL_LOCAL_DIR"
-
-          python3 -m pip install --upgrade huggingface_hub
-
-          python3 << 'PYEOF'
-          import os
-          from huggingface_hub import snapshot_download
-
-          repo = os.environ["MODEL_REPO"]
-          include = os.environ["MODEL_INCLUDE"]
-          local_dir = os.environ["MODEL_LOCAL_DIR"]
-          token = os.environ.get("HF_TOKEN")
-
-          snapshot_download(
-              repo_id=repo,
-              allow_patterns=include,
-              local_dir=local_dir,
-              token=token,
-              local_dir_use_symlinks=False
-          )
-          PYEOF
-
-          echo ""
-          echo "Downloaded files:"
-          find "$MODEL_LOCAL_DIR" -type f | sort
-          echo ""
-
-          # Check if we have split shards
-          SHARD_COUNT=$(find "$MODEL_LOCAL_DIR" -name '*-of-*.gguf' | wc -l)
-
-          if [ "$SHARD_COUNT" -gt 0 ]; then
-            echo "Detected split GGUF shards ($SHARD_COUNT files). Merging..."
-
-            # Find the first shard to determine the base name
-            FIRST_SHARD=$(find "$MODEL_LOCAL_DIR" -name '*-of-*.gguf' | sort | head -n 1)
-            SHARD_DIR=$(dirname "$FIRST_SHARD")
-
-            # Extract base name (remove -00001-of-XXXXX.gguf suffix)
-            BASENAME=$(basename "$FIRST_SHARD" | sed 's/-[0-9]\+-of-[0-9]\+\.gguf$//')
-            MERGED_FILE="$SHARD_DIR/${BASENAME}.gguf"
-
-            echo "Merging shards into: $MERGED_FILE"
-            ./build/bin/llama-gguf-split --merge "$SHARD_DIR/${BASENAME}-00001-of-"*.gguf "$MERGED_FILE"
-
-            if [ ! -f "$MERGED_FILE" ]; then
-              echo "Merge failed!"
-              exit 1
-            fi
-
-            echo "Merge successful. Merged file size:"
-            ls -lh "$MERGED_FILE"
-
-            MODEL_FILE="$MERGED_FILE"
-          else
-            MODEL_FILE=$(find "$MODEL_LOCAL_DIR" -type f -name '*.gguf' | sort | head -n 1)
-          fi
-
-          if [ -z "$MODEL_FILE" ] || [ ! -f "$MODEL_FILE" ]; then
-            echo "No GGUF model file found."
-            exit 1
-          fi
-
-          echo "MODEL_FILE=$MODEL_FILE" >> "$GITHUB_ENV"
-
-          echo ""
-          echo "Final model file: $MODEL_FILE"
-          ls -lh "$MODEL_FILE"
-
-      - name: Verify workers are reachable on RPC port
-        shell: bash
-        run: |
-          set -euo pipefail
-          IFS=',' read -r -a WORKERS <<< "$ACTIVE_WORKER_IPS"
-
-          check_worker() {
-            local ip="$1"
-            echo "Checking ${ip}:${RPC_PORT} ..."
-            for i in {1..60}; do
-              if nc -z -w 2 "$ip" "$RPC_PORT"; then
-                echo "${ip}:${RPC_PORT} is reachable"
-                return 0
-              fi
-              sleep 5
-            done
-            echo "Timed out waiting for ${ip}:${RPC_PORT}"
-            return 1
-          }
-
-          for ip in "${WORKERS[@]}"; do
-            check_worker "$ip"
-          done
-
-      - name: Start llama server with RPC and wait for health
-        shell: bash
-        run: |
-          set -euxo pipefail
-          cd llama.cpp
-
-          SERVER_THREADS=$(( $(nproc) > 2 ? $(nproc) - 2 : 1 ))
-
-          echo ""
-          echo "========================================"
-          echo "  STARTING LLAMA SERVER"
-          echo "  Model: $MODEL_LABEL"
-          echo "  Model file: $MODEL_FILE"
-          echo "  Workers: $ACTIVE_WORKER_ENDPOINTS"
-          echo "  Worker count: $ACTIVE_WORKER_COUNT"
-          echo "  API Key: ${{ inputs.api_key }}"
-          echo "  Context: ${{ inputs.ctx_size }}"
-          echo "  Parallel slots: 1"
-          echo "========================================"
-          echo ""
-
-          # Stream logs in background so we can see them
-          touch /tmp/llama-server.log
-          tail -f /tmp/llama-server.log &
-          TAIL_PID=$!
-
-          ./build/bin/llama-server             -m "$MODEL_FILE"             --rpc "$ACTIVE_WORKER_ENDPOINTS"             -c "${{ inputs.ctx_size }}"             -np 1             --split-mode layer             --cache-type-k q4_0             --cache-type-v q4_0             --threads "$SERVER_THREADS"             --threads-batch "$SERVER_THREADS"             --host 0.0.0.0             --port "$SERVER_PORT"             --api-key "${{ inputs.api_key }}"             --jinja             --no-webui             -ngl 0 > /tmp/llama-server.log 2>&1 &
-
-          LLAMA_PID=$!
-          echo "LLAMA_PID=$LLAMA_PID"
-
-          echo "Waiting for server to become ready..."
-          HEALTHY=0
-          for i in $(seq 1 180); do
-            if ! kill -0 "$LLAMA_PID" 2>/dev/null; then
-              echo "llama-server exited early!"
-              kill $TAIL_PID 2>/dev/null || true
-              echo ""
-              echo "=== FULL SERVER LOG ==="
-              cat /tmp/llama-server.log || true
-              echo "======================="
-              exit 1
-            fi
-
-            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${SERVER_PORT}/health" 2>/dev/null || echo "000")
-
-            if [ "$HTTP_STATUS" = "200" ]; then
-              echo "Server health check succeeded (HTTP 200)"
-              HEALTHY=1
-              break
-            elif [ "$HTTP_STATUS" = "503" ]; then
-              echo "Server still loading... (attempt $i/180, HTTP 503)"
-            else
-              echo "Waiting for server... (attempt $i/180, HTTP $HTTP_STATUS)"
-            fi
-
-            sleep 5
-          done
-
-          kill $TAIL_PID 2>/dev/null || true
-
-          if [ "$HEALTHY" != "1" ]; then
-            echo "Server never became healthy"
-            echo ""
-            echo "=== FULL SERVER LOG ==="
-            cat /tmp/llama-server.log || true
-            echo "======================="
-            exit 1
-          fi
-
-          echo ""
-          echo "Last 50 log lines:"
-          tail -n 50 /tmp/llama-server.log || true
-          echo ""
-          echo "========================================"
-          echo "  SERVER IS RUNNING"
-          echo ""
-          echo "  API Endpoint: http://$MAIN_IP:${SERVER_PORT}"
-          echo "  Health Check: http://$MAIN_IP:${SERVER_PORT}/health"
-          echo ""
-          echo "  Configure your OpenAI-compatible client with:"
-          echo "  Base URL: http://$MAIN_IP:${SERVER_PORT}/v1"
-          echo "  API Key: ${{ inputs.api_key }}"
-          echo "  Model: $MODEL_API_NAME"
-          echo ""
-          echo "  This server will run for roughly 6 hours"
-          echo "========================================"
-          echo ""
-
-          END_TIME=$((SECONDS + KEEPALIVE_SECONDS))
-          while [ "$SECONDS" -lt "$END_TIME" ]; do
-            if ! kill -0 "$LLAMA_PID" 2>/dev/null; then
-              echo "llama-server stopped unexpectedly"
-              cat /tmp/llama-server.log || true
-              exit 1
-            fi
-            sleep 30
-          done
-
-      - name: Cleanup on exit
-        if: always()
-        shell: bash
-        run: |
-          set +e
-          echo "Shutting down server..."
-          pkill -f llama-server || true
-          sudo tailscale down || true
+Run set -euxo pipefail
++ cd llama.cpp
++ mkdir -p models/devstral
++ python3 -m pip install --upgrade huggingface_hub
+Defaulting to user installation because normal site-packages is not writeable
+Collecting huggingface_hub
+  Downloading huggingface_hub-1.21.0-py3-none-any.whl.metadata (14 kB)
+Collecting click>=8.4.0 (from huggingface_hub)
+  Downloading click-8.4.2-py3-none-any.whl.metadata (2.6 kB)
+Collecting filelock>=3.10.0 (from huggingface_hub)
+  Downloading filelock-3.29.4-py3-none-any.whl.metadata (2.0 kB)
+Collecting fsspec>=2023.5.0 (from huggingface_hub)
+  Downloading fsspec-2026.6.0-py3-none-any.whl.metadata (10 kB)
+Collecting hf-xet<2.0.0,>=1.5.1 (from huggingface_hub)
+  Downloading hf_xet-1.5.1-cp37-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl.metadata (4.9 kB)
+Collecting httpx<1,>=0.23.0 (from huggingface_hub)
+  Downloading httpx-0.28.1-py3-none-any.whl.metadata (7.1 kB)
+Requirement already satisfied: packaging>=20.9 in /usr/lib/python3/dist-packages (from huggingface_hub) (24.0)
+Requirement already satisfied: pyyaml>=5.1 in /usr/lib/python3/dist-packages (from huggingface_hub) (6.0.1)
+Collecting tqdm>=4.42.1 (from huggingface_hub)
+  Downloading tqdm-4.68.3-py3-none-any.whl.metadata (57 kB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 57.4/57.4 kB 13.8 MB/s eta 0:00:00
+Collecting typer<0.26.0,>=0.20.0 (from huggingface_hub)
+  Downloading typer-0.25.1-py3-none-any.whl.metadata (15 kB)
+Requirement already satisfied: typing-extensions>=4.1.0 in /usr/lib/python3/dist-packages (from huggingface_hub) (4.10.0)
+Collecting anyio (from httpx<1,>=0.23.0->huggingface_hub)
+  Downloading anyio-4.14.1-py3-none-any.whl.metadata (4.6 kB)
+Requirement already satisfied: certifi in /usr/lib/python3/dist-packages (from httpx<1,>=0.23.0->huggingface_hub) (2023.11.17)
+Collecting httpcore==1.* (from httpx<1,>=0.23.0->huggingface_hub)
+  Downloading httpcore-1.0.9-py3-none-any.whl.metadata (21 kB)
+Requirement already satisfied: idna in /usr/lib/python3/dist-packages (from httpx<1,>=0.23.0->huggingface_hub) (3.6)
+Collecting h11>=0.16 (from httpcore==1.*->httpx<1,>=0.23.0->huggingface_hub)
+  Downloading h11-0.16.0-py3-none-any.whl.metadata (8.3 kB)
+Collecting shellingham>=1.3.0 (from typer<0.26.0,>=0.20.0->huggingface_hub)
+  Downloading shellingham-1.5.4-py2.py3-none-any.whl.metadata (3.5 kB)
+Collecting rich>=13.8.0 (from typer<0.26.0,>=0.20.0->huggingface_hub)
+  Downloading rich-15.0.0-py3-none-any.whl.metadata (18 kB)
+Collecting annotated-doc>=0.0.2 (from typer<0.26.0,>=0.20.0->huggingface_hub)
+  Downloading annotated_doc-0.0.4-py3-none-any.whl.metadata (6.6 kB)
+Requirement already satisfied: markdown-it-py>=2.2.0 in /usr/lib/python3/dist-packages (from rich>=13.8.0->typer<0.26.0,>=0.20.0->huggingface_hub) (3.0.0)
+Requirement already satisfied: pygments<3.0.0,>=2.13.0 in /usr/lib/python3/dist-packages (from rich>=13.8.0->typer<0.26.0,>=0.20.0->huggingface_hub) (2.17.2)
+Requirement already satisfied: mdurl~=0.1 in /usr/lib/python3/dist-packages (from markdown-it-py>=2.2.0->rich>=13.8.0->typer<0.26.0,>=0.20.0->huggingface_hub) (0.1.2)
+Downloading huggingface_hub-1.21.0-py3-none-any.whl (721 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 721.1/721.1 kB 57.4 MB/s eta 0:00:00
+Downloading click-8.4.2-py3-none-any.whl (119 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 119.2/119.2 kB 42.9 MB/s eta 0:00:00
+Downloading filelock-3.29.4-py3-none-any.whl (42 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 42.8/42.8 kB 16.1 MB/s eta 0:00:00
+Downloading fsspec-2026.6.0-py3-none-any.whl (203 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 203.9/203.9 kB 65.9 MB/s eta 0:00:00
+Downloading hf_xet-1.5.1-cp37-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (4.5 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 4.5/4.5 MB 143.3 MB/s eta 0:00:00
+Downloading httpx-0.28.1-py3-none-any.whl (73 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 73.5/73.5 kB 30.0 MB/s eta 0:00:00
+Downloading httpcore-1.0.9-py3-none-any.whl (78 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 78.8/78.8 kB 28.9 MB/s eta 0:00:00
+Downloading tqdm-4.68.3-py3-none-any.whl (78 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 78.3/78.3 kB 33.6 MB/s eta 0:00:00
+Downloading typer-0.25.1-py3-none-any.whl (58 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 58.4/58.4 kB 23.5 MB/s eta 0:00:00
+Downloading annotated_doc-0.0.4-py3-none-any.whl (5.3 kB)
+Downloading rich-15.0.0-py3-none-any.whl (310 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 310.7/310.7 kB 97.1 MB/s eta 0:00:00
+Downloading shellingham-1.5.4-py2.py3-none-any.whl (9.8 kB)
+Downloading anyio-4.14.1-py3-none-any.whl (124 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 124.9/124.9 kB 48.9 MB/s eta 0:00:00
+Downloading h11-0.16.0-py3-none-any.whl (37 kB)
+Installing collected packages: tqdm, shellingham, hf-xet, h11, fsspec, filelock, click, anyio, annotated-doc, rich, httpcore, typer, httpx, huggingface_hub
+Successfully installed annotated-doc-0.0.4 anyio-4.14.1 click-8.4.2 filelock-3.29.4 fsspec-2026.6.0 h11-0.16.0 hf-xet-1.5.1 httpcore-1.0.9 httpx-0.28.1 huggingface_hub-1.21.0 rich-15.0.0 shellingham-1.5.4 tqdm-4.68.3 typer-0.25.1
++ python3
+/home/runner/.local/lib/python3.12/site-packages/huggingface_hub/utils/_validators.py:205: UserWarning: The `local_dir_use_symlinks` argument is deprecated and ignored in `snapshot_download`. Downloading to a local directory does not use symlinks anymore.
+  warnings.warn(
+Fetching 1 files:   0%|          | 0/1 [00:00<?, ?it/s]
+Fetching 1 files: 100%|██████████| 1/1 [01:25<00:00, 85.09s/it]
+Fetching 1 files: 100%|██████████| 1/1 [01:25<00:00, 85.09s/it]
++ echo ''
++ echo 'Downloaded files:'
++ find models/devstral -type f
++ sort
+Downloaded files:
+models/devstral/.cache/huggingface/.gitignore
+models/devstral/.cache/huggingface/CACHEDIR.TAG
+models/devstral/.cache/huggingface/download/devstralQ4_K_M.gguf.metadata
+models/devstral/devstralQ4_K_M.gguf
++ echo ''
+++ find models/devstral -name '*-of-*.gguf'
+++ wc -l
++ SHARD_COUNT=0
++ '[' 0 -gt 0 ']'
+++ find models/devstral -type f -name '*.gguf'
+++ sort
+++ head -n 1
++ MODEL_FILE=models/devstral/devstralQ4_K_M.gguf
++ '[' -z models/devstral/devstralQ4_K_M.gguf ']'
++ '[' '!' -f models/devstral/devstralQ4_K_M.gguf ']'
++ echo MODEL_FILE=models/devstral/devstralQ4_K_M.gguf
++ echo ''
++ echo 'Final model file: models/devstral/devstralQ4_K_M.gguf'
++ ls -lh models/devstral/devstralQ4_K_M.gguf
+Final model file: models/devstral/devstralQ4_K_M.gguf
+-rw-r--r-- 1 runner runner 14G Jun 27 14:14 models/devstral/devstralQ4_K_M.gguf
+0s
+Run set -euo pipefail
+Checking 100.79.241.108:50052 ...
+Connection to 100.79.241.108 50052 port [tcp/*] succeeded!
+100.79.241.108:50052 is reachable
+Checking 100.94.252.76:50052 ...
+Connection to 100.94.252.76 50052 port [tcp/*] succeeded!
+100.94.252.76:50052 is reachable
+Checking 100.118.185.21:50052 ...
+Connection to 100.118.185.21 50052 port [tcp/*] succeeded!
+100.118.185.21:50052 is reachable
+Checking 100.76.240.6:50052 ...
+Connection to 100.76.240.6 50052 port [tcp/*] succeeded!
+100.76.240.6:50052 is reachable
+Checking 100.82.49.60:50052 ...
+Connection to 100.82.49.60 50052 port [tcp/*] succeeded!
+100.82.49.60:50052 is reachable
+25s
+Run set -euxo pipefail
++ cd llama.cpp
+++ nproc
+++ nproc
++ SERVER_THREADS=2
++ echo ''
++ echo ========================================
++ echo '  STARTING LLAMA SERVER'
++ echo '  Model: Devstral Small 2505 Q4_K_M'
++ echo '  Model file: models/devstral/devstralQ4_K_M.gguf'
+========================================
+  STARTING LLAMA SERVER
+  Model: Devstral Small 2505 Q4_K_M
+  Model file: models/devstral/devstralQ4_K_M.gguf
++ echo '  Workers: 100.79.241.108:50052,100.94.252.76:50052,100.118.185.21:50052,100.76.240.6:50052,100.82.49.60:50052'
+  Workers: 100.79.241.108:50052,100.94.252.76:50052,100.118.185.21:50052,100.76.240.6:50052,100.82.49.60:50052
++ echo '  Worker count: 5'
+  Worker count: 5
+  API Key: sk-local-llama
+  Context: 50000
+  Parallel slots: 1
+========================================
++ echo '  API Key: sk-local-llama'
++ echo '  Context: 50000'
++ echo '  Parallel slots: 1'
++ echo ========================================
++ echo ''
++ touch /tmp/llama-server.log
++ TAIL_PID=6390
+LLAMA_PID=6391
++ tail -f /tmp/llama-server.log
+Waiting for server to become ready...
++ LLAMA_PID=6391
++ echo LLAMA_PID=6391
++ echo 'Waiting for server to become ready...'
++ HEALTHY=0
++ ./build/bin/llama-server -m models/devstral/devstralQ4_K_M.gguf --rpc 100.79.241.108:50052,100.94.252.76:50052,100.118.185.21:50052,100.76.240.6:50052,100.82.49.60:50052 -c 50000 -np 1 --split-mode layer --cache-type-k q4_0 --cache-type-v q4_0 --threads 2 --threads-batch 2 --host 0.0.0.0 --port 8080 --api-key sk-local-llama --jinja --no-webui -ngl 0
+++ seq 1 180
++ for i in $(seq 1 180)
++ kill -0 6391
+++ curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/health
+++ echo 000
++ HTTP_STATUS=000000
+Waiting for server... (attempt 1/180, HTTP 000000)
++ '[' 000000 = 200 ']'
++ '[' 000000 = 503 ']'
++ echo 'Waiting for server... (attempt 1/180, HTTP 000000)'
++ sleep 5
++ for i in $(seq 1 180)
++ kill -0 6391
+++ curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/health
+++ echo 000
++ HTTP_STATUS=000000
++ '[' 000000 = 200 ']'
++ '[' 000000 = 503 ']'
++ echo 'Waiting for server... (attempt 2/180, HTTP 000000)'
++ sleep 5
+Waiting for server... (attempt 2/180, HTTP 000000)
++ for i in $(seq 1 180)
++ kill -0 6391
+++ curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/health
+++ echo 000
++ HTTP_STATUS=000000
++ '[' 000000 = 200 ']'
++ '[' 000000 = 503 ']'
++ echo 'Waiting for server... (attempt 3/180, HTTP 000000)'
++ sleep 5
+Waiting for server... (attempt 3/180, HTTP 000000)
++ for i in $(seq 1 180)
++ kill -0 6391
+++ curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/health
+++ echo 000
++ HTTP_STATUS=000000
++ '[' 000000 = 200 ']'
++ '[' 000000 = 503 ']'
++ echo 'Waiting for server... (attempt 4/180, HTTP 000000)'
++ sleep 5
+Waiting for server... (attempt 4/180, HTTP 000000)
++ for i in $(seq 1 180)
++ kill -0 6391
+++ curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/health
+++ echo 000
++ HTTP_STATUS=000000
++ '[' 000000 = 200 ']'
++ '[' 000000 = 503 ']'
++ echo 'Waiting for server... (attempt 5/180, HTTP 000000)'
++ sleep 5
+Waiting for server... (attempt 5/180, HTTP 000000)
