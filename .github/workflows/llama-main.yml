@@ -233,27 +233,26 @@ jobs:
               ;;
           esac
 
-      - name: Download selected model
+            - name: Download selected model
         shell: bash
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: |
+    run: |
           set -euxo pipefail
           cd llama.cpp
           mkdir -p "$MODEL_LOCAL_DIR"
 
-          HF_ARGS=()
+          # Authenticate with hf CLI
           if [ -n "${HF_TOKEN:-}" ]; then
-            HF_ARGS+=(--token "$HF_TOKEN")
+            echo "$HF_TOKEN" | hf auth login --token-stdin
           else
             echo "WARNING: No HF_TOKEN found. Anonymous downloads may be throttled."
           fi
 
-          huggingface-cli download \
-            "$MODEL_REPO" \
+          # Download using hf CLI
+          hf download "$MODEL_REPO" \
             --include "$MODEL_INCLUDE" \
-            --local-dir "$MODEL_LOCAL_DIR" \
-            "${HF_ARGS[@]}"
+            --local-dir "$MODEL_LOCAL_DIR"
 
           MODEL_FILE="$(find "$MODEL_LOCAL_DIR" -type f -name '*.gguf' | sort | head -n 1)"
           if [ -z "$MODEL_FILE" ]; then
