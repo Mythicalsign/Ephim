@@ -306,7 +306,24 @@ jobs:
           echo "========================================"
           echo ""
 
-          nohup ./build/bin/llama-server             -m "$MODEL_FILE"             --rpc "$ACTIVE_WORKER_ENDPOINTS"             -c "${{ inputs.ctx_size }}"             -np 1             --cache-type-k q8_0             --cache-type-v q8_0             --cache-ram 0             --threads "$SERVER_THREADS"             --threads-batch "$SERVER_THREADS"             --host 0.0.0.0             --port "$SERVER_PORT"             --api-key "${{ inputs.api_key }}"             --jinja             --no-webui             -ngl 0 > /tmp/llama-server.log 2>&1 &
+          nohup ./build/bin/llama-server \
+            -m "$MODEL_FILE" \
+            --rpc "$ACTIVE_WORKER_ENDPOINTS" \
+            -c "${{ inputs.ctx_size }}" \
+            -np 1 \
+            --cache-type-k q8_0 \
+            --cache-type-v q8_0 \
+            --cache-ram 0 \
+            --threads "$SERVER_THREADS" \
+            --threads-batch "$SERVER_THREADS" \
+            --host 0.0.0.0 \
+            --port "$SERVER_PORT" \
+            --api-key "${{ inputs.api_key }}" \
+            --jinja \
+            --no-webui \
+            --no-repack \
+            -ngl 999 \
+            > /tmp/llama-server.log 2>&1 &
 
           LLAMA_PID=$!
           echo "LLAMA_PID=$LLAMA_PID"
