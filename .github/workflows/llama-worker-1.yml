@@ -71,7 +71,9 @@ jobs:
           sudo tailscale up \
             --authkey "${{ secrets.TAILSCALE_AUTHKEY }}" \
             --hostname="llama-worker1-${{ github.run_id }}" \
-            --accept-routes
+            --accept-routes \
+            --reset \
+            --timeout=30s
 
           for i in {1..30}; do
             WORKER_IP="$(tailscale ip -4 2>/dev/null || true)"
