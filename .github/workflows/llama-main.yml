@@ -3,6 +3,46 @@ name: LLaMA Main Server
 on:
   workflow_dispatch:
     inputs:
+      worker1_ip:
+        description: 'Worker 1 Tailscale IP (required)'
+        required: true
+        type: string
+      worker2_ip:
+        description: 'Worker 2 Tailscale IP (required)'
+        required: true
+        type: string
+      worker3_ip:
+        description: 'Worker 3 Tailscale IP (required)'
+        required: true
+        type: string
+      worker4_ip:
+        description: 'Worker 4 Tailscale IP (optional)'
+        required: false
+        type: string
+      worker5_ip:
+        description: 'Worker 5 Tailscale IP (optional)'
+        required: false
+        type: string
+      worker6_ip:
+        description: 'Worker 6 Tailscale IP (optional)'
+        required: false
+        type: string
+      worker7_ip:
+        description: 'Worker 7 Tailscale IP (optional)'
+        required: false
+        type: string
+      worker8_ip:
+        description: 'Worker 8 Tailscale IP (optional)'
+        required: false
+        type: string
+      worker9_ip:
+        description: 'Worker 9 Tailscale IP (optional)'
+        required: false
+        type: string
+      worker10_ip:
+        description: 'Worker 10 Tailscale IP (optional)'
+        required: false
+        type: string
       duration_minutes:
         description: 'How long to keep the runner alive (minutes)'
         required: true
@@ -78,6 +118,81 @@ jobs:
           echo "Tailscale IPv4 was not assigned in time"
           exit 1
 
+      - name: Collect and validate active workers
+        shell: bash
+        env:
+          WORKER1_IP: ${{ inputs.worker1_ip }}
+          WORKER2_IP: ${{ inputs.worker2_ip }}
+          WORKER3_IP: ${{ inputs.worker3_ip }}
+          WORKER4_IP: ${{ inputs.worker4_ip }}
+          WORKER5_IP: ${{ inputs.worker5_ip }}
+          WORKER6_IP: ${{ inputs.worker6_ip }}
+          WORKER7_IP: ${{ inputs.worker7_ip }}
+          WORKER8_IP: ${{ inputs.worker8_ip }}
+          WORKER9_IP: ${{ inputs.worker9_ip }}
+          WORKER10_IP: ${{ inputs.worker10_ip }}
+        run: |
+          set -euo pipefail
+          ACTIVE_WORKERS=()
+          SEEN='|'
+
+          for idx in $(seq 1 10); do
+            var="WORKER${idx}_IP"
+            ip="${!var:-}"
+            if [ -z "$ip" ]; then
+              continue
+            fi
+            if [[ "$SEEN" == *"|$ip|"* ]]; then
+              echo "Duplicate worker IP detected: $ip"
+              exit 1
+            fi
+            ACTIVE_WORKERS+=("$ip")
+            SEEN="${SEEN}${ip}|"
+          done
+
+          if [ "${#ACTIVE_WORKERS[@]}" -lt 3 ]; then
+            echo "This workflow requires at least 3 worker IPs."
+            exit 1
+          fi
+
+          ACTIVE_ENDPOINTS=()
+          for ip in "${ACTIVE_WORKERS[@]}"; do
+            ACTIVE_ENDPOINTS+=("${ip}:${RPC_PORT}")
+          done
+
+          ACTIVE_WORKER_IPS_JOINED="$(IFS=,; echo "${ACTIVE_WORKERS[*]}")"
+          ACTIVE_WORKER_ENDPOINTS_JOINED="$(IFS=,; echo "${ACTIVE_ENDPOINTS[*]}")"
+
+          {
+            echo "ACTIVE_WORKER_COUNT=${#ACTIVE_WORKERS[@]}"
+            echo "ACTIVE_WORKER_IPS=$ACTIVE_WORKER_IPS_JOINED"
+            echo "ACTIVE_WORKER_ENDPOINTS=$ACTIVE_WORKER_ENDPOINTS_JOINED"
+          } >> "$GITHUB_ENV"
+
+      - name: Verify workers are reachable on RPC port
+        shell: bash
+        run: |
+          set -euo pipefail
+          IFS=',' read -r -a WORKERS <<< "$ACTIVE_WORKER_IPS"
+
+          check_worker() {
+            local ip="$1"
+            echo "Checking ${ip}:${RPC_PORT} ..."
+            for i in {1..60}; do
+              if nc -z -w 2 "$ip" "$RPC_PORT"; then
+                echo "${ip}:${RPC_PORT} is reachable"
+                return 0
+              fi
+              sleep 5
+            done
+            echo "Timed out waiting for ${ip}:${RPC_PORT}"
+            return 1
+          }
+
+          for ip in "${WORKERS[@]}"; do
+            check_worker "$ip"
+          done
+
       - name: Setup SSH server
         shell: bash
         run: |
@@ -106,6 +221,9 @@ jobs:
           echo "  llama.cpp location: ~/work/llama.cpp/llama.cpp"
           echo "  Binaries:           ~/work/llama.cpp/llama.cpp/build/bin/"
           echo ""
+          echo "  Active workers: $ACTIVE_WORKER_COUNT"
+          echo "  Worker endpoints: $ACTIVE_WORKER_ENDPOINTS"
+          echo ""
           echo "  SSH into the runner:"
           echo "    tailscale ssh runner@$MAIN_IP"
           echo ""
@@ -118,7 +236,7 @@ jobs:
           echo "  To start the server manually, SSH in and run:"
           echo "    cd ~/work/llama.cpp/llama.cpp"
           echo "    ./build/bin/llama-server -m /path/to/model.gguf \"
-          echo "      --rpc <worker1>:50052,<worker2>:50052,... \"
+          echo "      --rpc $ACTIVE_WORKER_ENDPOINTS \"
           echo "      -c 32768 -np 1 --host 0.0.0.0 --port 8080 \"
           echo "      --api-key sk-local-llama --jinja --no-webui -ngl 0"
           echo ""
