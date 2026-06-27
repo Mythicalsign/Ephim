@@ -85,8 +85,8 @@ jobs:
             echo "Could not find llama-server binary"
             exit 1
           fi
-          if [ ! -x ./build/bin/llama-rpc-server ]; then
-            echo "Could not find llama-rpc-server binary"
+          if [ ! -x ./build/bin/ggml-rpc-server ]; then
+            echo "Could not find ggml-rpc-server binary"
             exit 1
           fi
           if [ ! -x ./build/bin/llama-gguf-split ]; then
@@ -241,7 +241,7 @@ jobs:
           echo "      --api-key sk-local-llama --jinja --no-webui -ngl 0"
           echo ""
           echo "  To start a local RPC worker on this machine:"
-          echo "    ./build/bin/llama-rpc-server -H 0.0.0.0 -p 50052"
+          echo "    ./build/bin/ggml-rpc-server -H 0.0.0.0 -p 50052"
           echo "========================================"
           echo ""
 
