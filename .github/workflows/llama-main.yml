@@ -3,64 +3,10 @@ name: LLaMA Main Server
 on:
   workflow_dispatch:
     inputs:
-      model_choice:
-        description: 'Model to download and serve'
+      duration_minutes:
+        description: 'How long to keep the runner alive (minutes)'
         required: true
-        type: choice
-        options:
-          - Devstral-Small-2505-Q4_K_M
-          - Qwen3-Coder-Next-Q4_K_M
-        default: Devstral-Small-2505-Q4_K_M
-      worker1_ip:
-        description: 'Worker 1 Tailscale IP (required)'
-        required: true
-        type: string
-      worker2_ip:
-        description: 'Worker 2 Tailscale IP (required)'
-        required: true
-        type: string
-      worker3_ip:
-        description: 'Worker 3 Tailscale IP (required)'
-        required: true
-        type: string
-      worker4_ip:
-        description: 'Worker 4 Tailscale IP (optional)'
-        required: false
-        type: string
-      worker5_ip:
-        description: 'Worker 5 Tailscale IP (optional)'
-        required: false
-        type: string
-      worker6_ip:
-        description: 'Worker 6 Tailscale IP (optional)'
-        required: false
-        type: string
-      worker7_ip:
-        description: 'Worker 7 Tailscale IP (optional)'
-        required: false
-        type: string
-      worker8_ip:
-        description: 'Worker 8 Tailscale IP (optional)'
-        required: false
-        type: string
-      worker9_ip:
-        description: 'Worker 9 Tailscale IP (optional)'
-        required: false
-        type: string
-      worker10_ip:
-        description: 'Worker 10 Tailscale IP (optional)'
-        required: false
-        type: string
-      api_key:
-        description: 'API key for securing the server'
-        required: true
-        type: string
-        default: 'sk-local-llama'
-      ctx_size:
-        description: 'Context size (32768 is a safe default for GitHub-hosted runners)'
-        required: true
-        type: string
-        default: '32768'
+        default: '60'
 
 jobs:
   main-server:
@@ -71,7 +17,6 @@ jobs:
     env:
       RPC_PORT: "50052"
       SERVER_PORT: "8080"
-      KEEPALIVE_SECONDS: "21540"
 
     steps:
       - name: Install system dependencies
@@ -79,7 +24,7 @@ jobs:
         run: |
           set -euxo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends             build-essential             cmake             ninja-build             git             curl             wget             jq             python3             python3-pip             iproute2             netcat-openbsd             ca-certificates
+          sudo apt-get install -y --no-install-recommends             build-essential             cmake             ninja-build             git             curl             wget             jq             python3             python3-pip             iproute2             netcat-openbsd             ca-certificates             openssh-server
 
       - name: Build llama.cpp with RPC support
         shell: bash
@@ -90,7 +35,7 @@ jobs:
           cmake -S . -B build -G Ninja -DGGML_RPC=ON -DCMAKE_BUILD_TYPE=Release
           cmake --build build --parallel "$(nproc)"
 
-      - name: Verify server binary exists
+      - name: Verify binaries exist
         shell: bash
         run: |
           set -euxo pipefail
@@ -98,6 +43,14 @@ jobs:
           ls -la build/bin/
           if [ ! -x ./build/bin/llama-server ]; then
             echo "Could not find llama-server binary"
+            exit 1
+          fi
+          if [ ! -x ./build/bin/llama-rpc-server ]; then
+            echo "Could not find llama-rpc-server binary"
+            exit 1
+          fi
+          if [ ! -x ./build/bin/llama-gguf-split ]; then
+            echo "Could not find llama-gguf-split binary"
             exit 1
           fi
 
@@ -125,298 +78,65 @@ jobs:
           echo "Tailscale IPv4 was not assigned in time"
           exit 1
 
-      - name: Collect and validate active workers
-        shell: bash
-        env:
-          WORKER1_IP: ${{ inputs.worker1_ip }}
-          WORKER2_IP: ${{ inputs.worker2_ip }}
-          WORKER3_IP: ${{ inputs.worker3_ip }}
-          WORKER4_IP: ${{ inputs.worker4_ip }}
-          WORKER5_IP: ${{ inputs.worker5_ip }}
-          WORKER6_IP: ${{ inputs.worker6_ip }}
-          WORKER7_IP: ${{ inputs.worker7_ip }}
-          WORKER8_IP: ${{ inputs.worker8_ip }}
-          WORKER9_IP: ${{ inputs.worker9_ip }}
-          WORKER10_IP: ${{ inputs.worker10_ip }}
-        run: |
-          set -euo pipefail
-          ACTIVE_WORKERS=()
-          SEEN='|'
-
-          for idx in $(seq 1 10); do
-            var="WORKER${idx}_IP"
-            ip="${!var:-}"
-            if [ -z "$ip" ]; then
-              continue
-            fi
-            if [[ "$SEEN" == *"|$ip|"* ]]; then
-              echo "Duplicate worker IP detected: $ip"
-              exit 1
-            fi
-            ACTIVE_WORKERS+=("$ip")
-            SEEN="${SEEN}${ip}|"
-          done
-
-          if [ "${#ACTIVE_WORKERS[@]}" -lt 3 ]; then
-            echo "This workflow requires at least 3 worker IPs."
-            exit 1
-          fi
-
-          ACTIVE_ENDPOINTS=()
-          for ip in "${ACTIVE_WORKERS[@]}"; do
-            ACTIVE_ENDPOINTS+=("${ip}:${RPC_PORT}")
-          done
-
-          ACTIVE_WORKER_IPS_JOINED="$(IFS=,; echo "${ACTIVE_WORKERS[*]}")"
-          ACTIVE_WORKER_ENDPOINTS_JOINED="$(IFS=,; echo "${ACTIVE_ENDPOINTS[*]}")"
-
-          {
-            echo "ACTIVE_WORKER_COUNT=${#ACTIVE_WORKERS[@]}"
-            echo "ACTIVE_WORKER_IPS=$ACTIVE_WORKER_IPS_JOINED"
-            echo "ACTIVE_WORKER_ENDPOINTS=$ACTIVE_WORKER_ENDPOINTS_JOINED"
-          } >> "$GITHUB_ENV"
-
-      - name: Display main server Tailscale IP
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo ""
-          echo "========================================"
-          echo "  MAIN SERVER TAILSCALE IP"
-          echo "  $MAIN_IP"
-          echo "  Active workers: $ACTIVE_WORKER_COUNT"
-          echo "========================================"
-          echo ""
-
-      - name: Select model configuration
-        shell: bash
-        run: |
-          set -euo pipefail
-          case "${{ inputs.model_choice }}" in
-            Devstral-Small-2505-Q4_K_M)
-              {
-                echo "MODEL_REPO=mistralai/Devstral-Small-2505_gguf"
-                echo "MODEL_INCLUDE=devstralQ4_K_M.gguf"
-                echo "MODEL_LOCAL_DIR=models/devstral"
-                echo "MODEL_LABEL=Devstral Small 2505 Q4_K_M"
-                echo "MODEL_API_NAME=devstral-small-2505"
-              } >> "$GITHUB_ENV"
-              ;;
-            Qwen3-Coder-Next-Q4_K_M)
-              {
-                echo "MODEL_REPO=Qwen/Qwen3-Coder-Next-GGUF"
-                echo "MODEL_INCLUDE=Qwen3-Coder-Next-Q4_K_M/*"
-                echo "MODEL_LOCAL_DIR=models/qwen3-coder-next-q4-k-m"
-                echo "MODEL_LABEL=Qwen3-Coder-Next Q4_K_M"
-                echo "MODEL_API_NAME=Qwen3-Coder-Next"
-              } >> "$GITHUB_ENV"
-              ;;
-            *)
-              echo "Unsupported model selection: ${{ inputs.model_choice }}"
-              exit 1
-              ;;
-          esac
-
-      - name: Download and prepare model
-        shell: bash
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: |
-          set -euxo pipefail
-          cd llama.cpp
-          mkdir -p "$MODEL_LOCAL_DIR"
-
-          python3 -m pip install --upgrade huggingface_hub
-
-          python3 << 'PYEOF'
-          import os
-          from huggingface_hub import snapshot_download
-
-          repo = os.environ["MODEL_REPO"]
-          include = os.environ["MODEL_INCLUDE"]
-          local_dir = os.environ["MODEL_LOCAL_DIR"]
-          token = os.environ.get("HF_TOKEN")
-
-          snapshot_download(
-              repo_id=repo,
-              allow_patterns=include,
-              local_dir=local_dir,
-              token=token,
-              local_dir_use_symlinks=False
-          )
-          PYEOF
-
-          echo ""
-          echo "Downloaded files:"
-          find "$MODEL_LOCAL_DIR" -type f | sort
-          echo ""
-
-          # Check if we have split shards
-          SHARD_COUNT=$(find "$MODEL_LOCAL_DIR" -name '*-of-*.gguf' | wc -l)
-
-          if [ "$SHARD_COUNT" -gt 0 ]; then
-            echo "Detected split GGUF shards ($SHARD_COUNT files). Merging..."
-
-            FIRST_SHARD=$(find "$MODEL_LOCAL_DIR" -name '*-of-*.gguf' | sort | head -n 1)
-            SHARD_DIR=$(dirname "$FIRST_SHARD")
-            BASENAME=$(basename "$FIRST_SHARD" | sed 's/-[0-9]\+-of-[0-9]\+\.gguf$//')
-            MERGED_FILE="$SHARD_DIR/${BASENAME}.gguf"
-
-            echo "Merging shards into: $MERGED_FILE"
-            ./build/bin/llama-gguf-split --merge "$SHARD_DIR/${BASENAME}-00001-of-"*.gguf "$MERGED_FILE"
-
-            if [ ! -f "$MERGED_FILE" ]; then
-              echo "Merge failed!"
-              exit 1
-            fi
-
-            echo "Merge successful. Merged file size:"
-            ls -lh "$MERGED_FILE"
-
-            MODEL_FILE="$MERGED_FILE"
-          else
-            MODEL_FILE=$(find "$MODEL_LOCAL_DIR" -type f -name '*.gguf' | sort | head -n 1)
-          fi
-
-          if [ -z "$MODEL_FILE" ] || [ ! -f "$MODEL_FILE" ]; then
-            echo "No GGUF model file found."
-            exit 1
-          fi
-
-          echo "MODEL_FILE=$MODEL_FILE" >> "$GITHUB_ENV"
-
-          echo ""
-          echo "Final model file: $MODEL_FILE"
-          ls -lh "$MODEL_FILE"
-
-      - name: Verify workers are reachable on RPC port
-        shell: bash
-        run: |
-          set -euo pipefail
-          IFS=',' read -r -a WORKERS <<< "$ACTIVE_WORKER_IPS"
-
-          check_worker() {
-            local ip="$1"
-            echo "Checking ${ip}:${RPC_PORT} ..."
-            for i in {1..60}; do
-              if nc -z -w 2 "$ip" "$RPC_PORT"; then
-                echo "${ip}:${RPC_PORT} is reachable"
-                return 0
-              fi
-              sleep 5
-            done
-            echo "Timed out waiting for ${ip}:${RPC_PORT}"
-            return 1
-          }
-
-          for ip in "${WORKERS[@]}"; do
-            check_worker "$ip"
-          done
-
-      - name: Start llama server with RPC and wait for health
+      - name: Setup SSH server
         shell: bash
         run: |
           set -euxo pipefail
-          cd llama.cpp
 
-          SERVER_THREADS=$(( $(nproc) > 2 ? $(nproc) - 2 : 1 ))
+          # Enable passwordless sudo for runner user
+          echo "runner ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/runner-nopasswd
+          sudo chmod 440 /etc/sudoers.d/runner-nopasswd
 
+          # Start SSH
+          sudo service ssh start
+
+          echo "SSH server is available on port 22 via Tailscale IP"
+
+      - name: Display connection info
+        shell: bash
+        run: |
+          set -euxo pipefail
           echo ""
           echo "========================================"
-          echo "  STARTING LLAMA SERVER"
-          echo "  Model: $MODEL_LABEL"
-          echo "  Model file: $MODEL_FILE"
-          echo "  Workers: $ACTIVE_WORKER_ENDPOINTS"
-          echo "  Worker count: $ACTIVE_WORKER_COUNT"
-          echo "  API Key: ${{ inputs.api_key }}"
-          echo "  Context: ${{ inputs.ctx_size }}"
-          echo "  Parallel slots: 1"
-          echo "========================================"
+          echo "  LLAMA MAIN SERVER IS READY"
           echo ""
-
-          # Start server in background with unbuffered output
-          stdbuf -oL ./build/bin/llama-server             -m "$MODEL_FILE"             --rpc "$ACTIVE_WORKER_ENDPOINTS"             -c "${{ inputs.ctx_size }}"             -np 1             --split-mode layer             --cache-type-k q4_0             --cache-type-v q4_0             --threads "$SERVER_THREADS"             --threads-batch "$SERVER_THREADS"             --host 0.0.0.0             --port "$SERVER_PORT"             --api-key "${{ inputs.api_key }}"             --jinja             --no-webui             -ngl 0 > /tmp/llama-server.log 2>&1 &
-
-          LLAMA_PID=$!
-          echo "LLAMA_PID=$LLAMA_PID"
-
-          # Give the server a moment to start and potentially crash
-          sleep 10
-
-          # Check if it died immediately
-          if ! kill -0 "$LLAMA_PID" 2>/dev/null; then
-            echo "llama-server exited immediately after start!"
-            echo ""
-            echo "=== FULL SERVER LOG ==="
-            cat /tmp/llama-server.log || true
-            echo "======================="
-            exit 1
-          fi
-
-          echo "Server process is alive. Waiting for HTTP endpoint..."
-
-          HEALTHY=0
-          for i in $(seq 1 180); do
-            if ! kill -0 "$LLAMA_PID" 2>/dev/null; then
-              echo "llama-server exited during initialization!"
-              echo ""
-              echo "=== FULL SERVER LOG ==="
-              cat /tmp/llama-server.log || true
-              echo "======================="
-              exit 1
-            fi
-
-            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${SERVER_PORT}/health" 2>/dev/null || echo "000")
-
-            if [ "$HTTP_STATUS" = "200" ]; then
-              echo "Server health check succeeded (HTTP 200)"
-              HEALTHY=1
-              break
-            elif [ "$HTTP_STATUS" = "503" ]; then
-              echo "Server still loading... (attempt $i/180, HTTP 503)"
-            else
-              echo "Waiting for server... (attempt $i/180, HTTP $HTTP_STATUS)"
-            fi
-
-            sleep 5
-          done
-
-          if [ "$HEALTHY" != "1" ]; then
-            echo "Server never became healthy"
-            echo ""
-            echo "=== FULL SERVER LOG ==="
-            cat /tmp/llama-server.log || true
-            echo "======================="
-            exit 1
-          fi
-
+          echo "  Tailscale IP: $MAIN_IP"
+          echo "  Hostname:     llama-main-${{ github.run_id }}"
           echo ""
-          echo "Last 50 log lines:"
-          tail -n 50 /tmp/llama-server.log || true
+          echo "  llama.cpp location: ~/work/llama.cpp/llama.cpp"
+          echo "  Binaries:           ~/work/llama.cpp/llama.cpp/build/bin/"
           echo ""
-          echo "========================================"
-          echo "  SERVER IS RUNNING"
+          echo "  SSH into the runner:"
+          echo "    tailscale ssh runner@$MAIN_IP"
           echo ""
-          echo "  API Endpoint: http://$MAIN_IP:${SERVER_PORT}"
-          echo "  Health Check: http://$MAIN_IP:${SERVER_PORT}/health"
+          echo "  Or use hostname:"
+          echo "    tailscale ssh runner@llama-main-${{ github.run_id }}"
           echo ""
-          echo "  Configure your OpenAI-compatible client with:"
-          echo "  Base URL: http://$MAIN_IP:${SERVER_PORT}/v1"
-          echo "  API Key: ${{ inputs.api_key }}"
-          echo "  Model: $MODEL_API_NAME"
+          echo "  The 'runner' user password is empty."
+          echo "  Use key auth or sudo without password."
           echo ""
-          echo "  This server will run for roughly 6 hours"
+          echo "  To start the server manually, SSH in and run:"
+          echo "    cd ~/work/llama.cpp/llama.cpp"
+          echo "    ./build/bin/llama-server -m /path/to/model.gguf \"
+          echo "      --rpc <worker1>:50052,<worker2>:50052,... \"
+          echo "      -c 32768 -np 1 --host 0.0.0.0 --port 8080 \"
+          echo "      --api-key sk-local-llama --jinja --no-webui -ngl 0"
+          echo ""
+          echo "  To start a local RPC worker on this machine:"
+          echo "    ./build/bin/llama-rpc-server -H 0.0.0.0 -p 50052"
           echo "========================================"
           echo ""
 
-          END_TIME=$((SECONDS + KEEPALIVE_SECONDS))
-          while [ "$SECONDS" -lt "$END_TIME" ]; do
-            if ! kill -0 "$LLAMA_PID" 2>/dev/null; then
-              echo "llama-server stopped unexpectedly"
-              cat /tmp/llama-server.log || true
-              exit 1
-            fi
-            sleep 30
+      - name: Keep runner alive
+        shell: bash
+        run: |
+          set -euxo pipefail
+          DURATION=${{ github.event.inputs.duration_minutes }}
+          echo "Keeping runner alive for ${DURATION} minutes..."
+          echo "Cancel this workflow to terminate the runner early."
+
+          for ((i=0; i<DURATION*60; i++)); do
+            sleep 1
           done
 
       - name: Cleanup on exit
@@ -424,6 +144,5 @@ jobs:
         shell: bash
         run: |
           set +e
-          echo "Shutting down server..."
-          pkill -f llama-server || true
+          echo "Shutting down..."
           sudo tailscale down || true
