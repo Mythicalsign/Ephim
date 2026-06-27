@@ -179,8 +179,7 @@ jobs:
             local ip="$1"
             echo "Checking ${ip}:${RPC_PORT} ..."
             for i in {1..60}; do
-              # Use timeout command to force a 3-second max on nc
-              if timeout 3 bash -c "exec 3<>/dev/tcp/${ip}/${RPC_PORT}"; then
+              if nc -z -w 3 "${ip}" "${RPC_PORT}" 2>/dev/null; then
                 echo "${ip}:${RPC_PORT} is reachable"
                 return 0
               fi

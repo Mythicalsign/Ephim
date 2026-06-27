@@ -103,7 +103,7 @@ jobs:
           set -euxo pipefail
           cd llama.cpp
           echo "Starting RPC server on 0.0.0.0:${RPC_PORT} ..."
-          nohup "$RPC_BIN" -H 0.0.0.0 -p "$RPC_PORT" -c > /tmp/llama-rpc.log 2>&1 &
+          nohup "$RPC_BIN" -H 0.0.0.0 -p "$RPC_PORT" > /tmp/llama-rpc.log 2>&1 &
           RPC_PID=$!
           echo "RPC_PID=$RPC_PID"
 
