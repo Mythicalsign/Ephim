@@ -383,9 +383,33 @@ jobs:
       - name: Verify workload distribution from llama-server log
         shell: bash
         run: |
-          set -uo pipefail
+          # IMPORTANT: GitHub Actions wraps this script with `bash -e -o pipefail`
+          # at invocation time (see the `shell:` line in the rendered run output).
+          # We deliberately turn BOTH of those off here, because this step contains
+          # several `grep ... | grep ... | awk ...` pipelines whose first grep is
+          # ALLOWED to return 1 (= no match yet). Under the default `-e -o pipefail`,
+          # the very first iteration of the per-worker loop would silently kill the
+          # whole step and you'd see the table header but no rows -- exactly the
+          # failure mode this fix addresses.
+          set +e
+          set +o pipefail
+          set -u
+
           IFS=',' read -r -a WORKERS <<< "$ACTIVE_WORKER_IPS"
           LOG=/tmp/llama-server.log
+
+          # llama-server's stdout is line-buffered through nohup, but the readiness
+          # probe in the previous step returns as soon as /v1/models answers, which
+          # on some llama.cpp builds is BEFORE all `load_tensors:` lines have been
+          # flushed to disk. Give the log a short grace period to settle so we
+          # don't run the parser against a half-written file.
+          mkdir -p /tmp/dist-check
+          for i in $(seq 1 24); do
+            if grep -qE "RPC\[[^]]+\].*buffer size|load_tensors:.*offloaded" "$LOG" 2>/dev/null; then
+              break
+            fi
+            sleep 5
+          done
 
           echo ""
           echo "================================================================"
@@ -395,13 +419,13 @@ jobs:
 
           # 1. Show how llama.cpp discovered the RPC devices.
           echo "[1/4] RPC devices registered by llama-server:"
-          grep -E "register_device|RPC.*device|RPC\[" "$LOG" | head -n 50 || true
+          grep -E "register_device|RPC.*device|RPC\[" "$LOG" 2>/dev/null | head -n 50
           echo ""
 
           # 2. Extract per-RPC buffer-size lines. llama.cpp prints lines like:
           #    load_tensors:   RPC[10.0.0.5:50052] model buffer size =  1234.56 MiB
           echo "[2/4] Per-worker model buffer allocations:"
-          BUFFER_LINES="$(grep -E "RPC\[[^]]+\].*buffer size" "$LOG" || true)"
+          BUFFER_LINES="$(grep -E "RPC\[[^]]+\].*buffer size" "$LOG" 2>/dev/null)"
           if [ -n "$BUFFER_LINES" ]; then
             echo "$BUFFER_LINES"
           else
@@ -427,10 +451,16 @@ jobs:
             fi
 
             # Sum all buffer-size MiB attributed to this worker (there may be multiple
-            # lines: model buffer, compute buffer, KV cache, etc.).
-            MIB="$(grep -E "RPC\[${ip}:${RPC_PORT}\].*buffer size" "$LOG" \
-                    | grep -oE '[0-9]+\.[0-9]+ MiB' \
-                    | awk '{s+=$1} END {if (NR>0) printf "%.2f", s; else print "0.00"}')"
+            # lines: model buffer, compute buffer, KV cache, etc.). Each stage in the
+            # pipeline is allowed to return 1 (no match) without aborting the step.
+            MATCHED_LINES="$(grep -E "RPC\[${ip}:${RPC_PORT}\].*buffer size" "$LOG" 2>/dev/null)"
+            if [ -n "$MATCHED_LINES" ]; then
+              MIB="$(printf '%s\n' "$MATCHED_LINES" \
+                      | grep -oE '[0-9]+\.[0-9]+ MiB' \
+                      | awk '{s+=$1} END {if (NR>0) printf "%.2f", s; else print "0.00"}')"
+            else
+              MIB="0.00"
+            fi
 
             if awk -v m="$MIB" 'BEGIN{exit !(m+0 > 0)}'; then
               STATUS="receiving workload"
@@ -454,8 +484,8 @@ jobs:
 
           # 4. Show the offload summary line
           echo "[4/4] Layer offload summary:"
-          grep -E "offloaded|offload to|llm_load_tensors|load_tensors:" "$LOG" \
-            | grep -Ei "offload|RPC|CPU" | head -n 30 || true
+          grep -E "offloaded|offload to|llm_load_tensors|load_tensors:" "$LOG" 2>/dev/null \
+            | grep -Ei "offload|RPC|CPU" | head -n 30
           echo ""
 
           echo "================================================================"
@@ -470,9 +500,17 @@ jobs:
           if [ "$NGL_VALUE" != "0" ] && [ "$ACTIVE_RECEIVERS" -eq 0 ]; then
             echo ""
             echo "ERROR: n_gpu_layers=$NGL_VALUE but zero workers received tensors."
-            echo "       Check the llama-server log above for RPC errors."
+            echo "       This usually means one of:"
+            echo "         * llama.cpp could not reach the RPC workers during load"
+            echo "           (check for 'failed to connect' or 'rpc_send_data' errors below)."
+            echo "         * The model fits entirely on the main runner and llama.cpp"
+            echo "           did not need to offload to RPC (rare for 30B Q4)."
+            echo "         * The llama.cpp build is too new/old and the buffer-size log"
+            echo "           format changed; inspect the raw log below."
             echo ""
-            tail -n 100 "$LOG" || true
+            echo "--- last 200 lines of /tmp/llama-server.log ---"
+            tail -n 200 "$LOG" 2>/dev/null
+            echo "--- end of log ---"
             exit 1
           fi
 
@@ -480,7 +518,12 @@ jobs:
         if: ${{ inputs.run_distribution_test == 'true' }}
         shell: bash
         run: |
-          set -uo pipefail
+          # Same rationale as the previous step: this block runs `ss | tail | wc`
+          # pipelines whose first command is allowed to return non-zero
+          # (no matching sockets yet), so we drop `-e` and `pipefail` locally.
+          set +e
+          set +o pipefail
+          set -u
           IFS=',' read -r -a WORKERS <<< "$ACTIVE_WORKER_IPS"
 
           echo ""
