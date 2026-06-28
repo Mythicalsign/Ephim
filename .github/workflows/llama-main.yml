@@ -337,6 +337,11 @@ jobs:
             done < /tmp/ts_args.txt
           fi
 
+          # NOTE: -v (verbose) is REQUIRED here. Without it, llama.cpp suppresses
+          # the per-RPC `load_tensors: RPC0[host:port] model buffer size = ...`
+          # INFO lines that the next step parses to confirm distribution. With
+          # default verbosity the log is ~9 lines long and the verifier sees no
+          # RPC traffic even though distribution is actually working.
           nohup "$LLAMA_BIN/llama-server" \
             -m "$MODEL_PATH" \
             --rpc "$ACTIVE_WORKER_ENDPOINTS" \
@@ -348,6 +353,7 @@ jobs:
             --jinja \
             --no-webui \
             -ngl "$NGL_VALUE" \
+            -v \
             "${TS_ARGS[@]}" \
             > /tmp/llama-server.log 2>&1 &
 
@@ -403,9 +409,18 @@ jobs:
           # on some llama.cpp builds is BEFORE all `load_tensors:` lines have been
           # flushed to disk. Give the log a short grace period to settle so we
           # don't run the parser against a half-written file.
+          # NOTE on the regex:
+          # llama.cpp tags per-RPC log lines with the device label, which has
+          # the form `RPC<index>[<host>:<port>]` (e.g. `RPC0[10.0.0.5:50052]`),
+          # not `RPC[<host>:<port>]`. Older versions of this workflow used
+          # `RPC\[` which never matched, so the verifier always reported
+          # "zero workers received tensors" even when distribution was fine.
+          # We accept any device index suffix: `RPC` followed by zero-or-more
+          # alphanumeric/underscore chars (handles `RPC0`, `RPC10`, and the
+          # rare label-less `RPC[` form some old builds emit).
           mkdir -p /tmp/dist-check
           for i in $(seq 1 24); do
-            if grep -qE "RPC\[[^]]+\].*buffer size|load_tensors:.*offloaded" "$LOG" 2>/dev/null; then
+            if grep -qE "RPC[A-Za-z0-9_]*\[[^]]+\].*buffer size|load_tensors:.*offloaded" "$LOG" 2>/dev/null; then
               break
             fi
             sleep 5
@@ -418,14 +433,18 @@ jobs:
           echo ""
 
           # 1. Show how llama.cpp discovered the RPC devices.
+          # The verbose log contains a `common_param: device_info:` block that
+          # lists each backend (CPU, RPC0, RPC1, ...) and also tagged lines
+          # like `RPC0[host:port]` once tensors are placed.
           echo "[1/4] RPC devices registered by llama-server:"
-          grep -E "register_device|RPC.*device|RPC\[" "$LOG" 2>/dev/null | head -n 50
+          grep -E "register_device|device_info:|^[0-9.]+ I cmn  common_param:[[:space:]]+- (CPU|RPC)|RPC[A-Za-z0-9_]*\[" "$LOG" 2>/dev/null | head -n 50
           echo ""
 
           # 2. Extract per-RPC buffer-size lines. llama.cpp prints lines like:
-          #    load_tensors:   RPC[10.0.0.5:50052] model buffer size =  1234.56 MiB
+          #    load_tensors:   RPC0[10.0.0.5:50052] model buffer size =  1234.56 MiB
+          # (The device prefix is `RPC<idx>`, not bare `RPC` -- accept both.)
           echo "[2/4] Per-worker model buffer allocations:"
-          BUFFER_LINES="$(grep -E "RPC\[[^]]+\].*buffer size" "$LOG" 2>/dev/null)"
+          BUFFER_LINES="$(grep -E "RPC[A-Za-z0-9_]*\[[^]]+\].*buffer size" "$LOG" 2>/dev/null)"
           if [ -n "$BUFFER_LINES" ]; then
             echo "$BUFFER_LINES"
           else
@@ -453,7 +472,9 @@ jobs:
             # Sum all buffer-size MiB attributed to this worker (there may be multiple
             # lines: model buffer, compute buffer, KV cache, etc.). Each stage in the
             # pipeline is allowed to return 1 (no match) without aborting the step.
-            MATCHED_LINES="$(grep -E "RPC\[${ip}:${RPC_PORT}\].*buffer size" "$LOG" 2>/dev/null)"
+            # Match `RPC<idx>[<ip>:<port>]` -- the optional index suffix is
+            # what current llama.cpp builds emit (RPC0, RPC1, ...).
+            MATCHED_LINES="$(grep -E "RPC[A-Za-z0-9_]*\[${ip}:${RPC_PORT}\].*buffer size" "$LOG" 2>/dev/null)"
             if [ -n "$MATCHED_LINES" ]; then
               MIB="$(printf '%s\n' "$MATCHED_LINES" \
                       | grep -oE '[0-9]+\.[0-9]+ MiB' \
@@ -484,8 +505,8 @@ jobs:
 
           # 4. Show the offload summary line
           echo "[4/4] Layer offload summary:"
-          grep -E "offloaded|offload to|llm_load_tensors|load_tensors:" "$LOG" 2>/dev/null \
-            | grep -Ei "offload|RPC|CPU" | head -n 30
+          grep -E "offloaded|offload to|llm_load_tensors|load_tensors:|llama_prepare_model_devices:|using device RPC" "$LOG" 2>/dev/null \
+            | grep -Ei "offload|RPC|CPU|using device" | head -n 30
           echo ""
 
           echo "================================================================"
