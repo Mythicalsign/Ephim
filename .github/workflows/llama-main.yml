@@ -57,7 +57,6 @@ jobs:
     env:
       RPC_PORT: "50052"
       SERVER_PORT: "8080"
-      STATS_PORT: "19999"
       API_KEY: "sk-local-llama"
       MODEL_REPO: "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF"
       MODEL_FILE: "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"
@@ -81,8 +80,7 @@ jobs:
             python3-pip \
             iproute2 \
             netcat-openbsd \
-            ca-certificates \
-            sysstat
+            ca-certificates
 
       - name: Build llama.cpp with RPC support
         shell: bash
@@ -135,64 +133,6 @@ jobs:
 
           echo "Tailscale IPv4 was not assigned in time"
           exit 1
-
-      - name: Start worker stats collector
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          STATS_LOG=/tmp/worker-stats.log
-          STATS_FIFO=/tmp/worker-stats-fifo
-
-          # Create a named pipe so we can feed lines into it from multiple nc calls
-          rm -f "$STATS_FIFO"
-          mkfifo "$STATS_FIFO"
-
-          # python3 -u reads the fifo and writes timestamped lines to the log.
-          # We use python3 here because bash read loops on a fifo are unreliable
-          # when the writer side reconnects repeatedly (as workers do every 60s).
-          python3 -u - "$STATS_FIFO" "$STATS_LOG" << 'PYEOF' &
-          import sys, datetime, os
-
-          fifo_path = sys.argv[1]
-          log_path  = sys.argv[2]
-
-          with open(log_path, 'a', buffering=1) as log:
-              while True:
-                  try:
-                      # Re-open the fifo each time it drains (writer reconnects)
-                      with open(fifo_path, 'r') as fifo:
-                          for line in fifo:
-                              line = line.rstrip('\n')
-                              if line:
-                                  ts = datetime.datetime.utcnow().strftime('%H:%M:%S')
-                                  log.write(f'[{ts}] {line}\n')
-                                  log.flush()
-                  except Exception:
-                      pass
-          PYEOF
-
-          LOGGER_PID=$!
-          echo "LOGGER_PID=$LOGGER_PID" >> "$GITHUB_ENV"
-          echo "STATS_LOG=$STATS_LOG"   >> "$GITHUB_ENV"
-          echo "STATS_FIFO=$STATS_FIFO" >> "$GITHUB_ENV"
-
-          # nc listener: accepts one connection at a time, writes to fifo, loops.
-          # -k (keep-open) is NOT used because it buffers across connections;
-          # instead we loop nc manually so each worker report is a fresh connection.
-          (
-            while true; do
-              nc -l -p "$STATS_PORT" -q 1 >> "$STATS_FIFO" 2>/dev/null || true
-              sleep 0
-            done
-          ) &
-          NC_PID=$!
-          echo "NC_PID=$NC_PID" >> "$GITHUB_ENV"
-
-          # Give the listener a moment to open the port
-          sleep 2
-          echo "Stats collector listening on port $STATS_PORT"
-          echo "Stats log: $STATS_LOG"
 
       - name: Collect and validate active workers
         shell: bash
@@ -270,6 +210,13 @@ jobs:
             check_worker "$ip"
           done
 
+      - name: Install hf CLI
+        shell: bash
+        run: |
+          set -euxo pipefail
+          pip install --break-system-packages "huggingface_hub[hf_xet]"
+          echo "HF_XET_HIGH_PERFORMANCE=1" >> "$GITHUB_ENV"
+
       - name: Download model from HuggingFace
         shell: bash
         env:
@@ -277,24 +224,17 @@ jobs:
         run: |
           set -euxo pipefail
           mkdir -p "$MODEL_DIR"
+
+          echo "Downloading $MODEL_FILE from $MODEL_REPO ..."
+          hf download "$MODEL_REPO" "$MODEL_FILE" \
+            --local-dir "$MODEL_DIR" \
+            --token "$HF_TOKEN"
+
           MODEL_PATH="$MODEL_DIR/$MODEL_FILE"
 
-          HF_URL="https://huggingface.co/${MODEL_REPO}/resolve/main/${MODEL_FILE}"
-
-          echo "Downloading $MODEL_FILE (~18.6 GB) ..."
-          echo "Source: $HF_URL"
-
-          wget \
-            --header="Authorization: Bearer ${HF_TOKEN}" \
-            --progress=bar:force \
-            --show-progress \
-            -O "$MODEL_PATH" \
-            "$HF_URL" \
-            2>&1
-
-          if [ ! -f "$MODEL_PATH" ] || [ ! -s "$MODEL_PATH" ]; then
-            echo "Download failed or file is empty"
-            ls -lah "$MODEL_DIR/" || true
+          if [ ! -f "$MODEL_PATH" ]; then
+            echo "Model file not found at $MODEL_PATH after download"
+            ls -la "$MODEL_DIR/"
             exit 1
           fi
 
@@ -379,9 +319,6 @@ jobs:
           echo "  Health check:"
           echo "    curl -H \"Authorization: Bearer $API_KEY\" \\"
           echo "         http://$MAIN_IP:$SERVER_PORT/v1/models"
-          echo ""
-          echo "  Worker stats port: $STATS_PORT"
-          echo "  Worker stats log:  $STATS_LOG"
           echo "========================================"
           echo ""
 
@@ -407,15 +344,12 @@ jobs:
               exit 1
             fi
 
-            # Print worker stats every 2 minutes (every 4 ticks of 30s)
-            if [ $((TICK % 4)) -eq 0 ]; then
+            # Log a heartbeat every 10 minutes
+            if [ $((TICK % 20)) -eq 0 ]; then
               REMAINING=$(( (END_TIME - SECONDS) / 60 ))
-              echo ""
               echo "[ $(date -u '+%H:%M:%S') ] Server healthy. ~${REMAINING}m remaining."
-              echo "--- Worker stats (last 10 reports) ---"
-              tail -n 10 "$STATS_LOG" 2>/dev/null || echo "  (no worker reports yet)"
-              echo "--------------------------------------"
-              echo ""
+              echo "  Base URL: http://$MAIN_IP:$SERVER_PORT/v1"
+              echo "  API Key:  $API_KEY"
             fi
           done
 
@@ -428,7 +362,5 @@ jobs:
           set +e
           echo "Shutting down..."
           kill "$SERVER_PID" 2>/dev/null || true
-          kill "$NC_PID"     2>/dev/null || true
-          kill "$LOGGER_PID" 2>/dev/null || true
           pkill -f 'llama-server' || true
           sudo tailscale down || true

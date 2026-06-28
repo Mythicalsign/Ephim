@@ -2,11 +2,6 @@ name: LLaMA Worker 9
 
 on:
   workflow_dispatch:
-    inputs:
-      main_ip:
-        description: 'Main node Tailscale IP (for stats reporting)'
-        required: true
-        type: string
 
 jobs:
   worker:
@@ -17,7 +12,6 @@ jobs:
     env:
       WORKER_ID: "9"
       RPC_PORT: "50052"
-      STATS_PORT: "19999"
       KEEPALIVE_SECONDS: "21540"
       LLAMA_CACHE: /tmp/llama-rpc-cache
 
@@ -35,8 +29,7 @@ jobs:
             curl \
             iproute2 \
             netcat-openbsd \
-            ca-certificates \
-            sysstat
+            ca-certificates
 
       - name: Build llama.cpp with RPC support
         shell: bash
@@ -103,7 +96,6 @@ jobs:
           echo "  WORKER $WORKER_ID IS READY"
           echo "  Tailscale IP: $WORKER_IP"
           echo "  RPC Port: $RPC_PORT"
-          echo "  Reporting stats to: ${{ inputs.main_ip }}:$STATS_PORT"
           echo "========================================"
           echo ""
 
@@ -140,53 +132,16 @@ jobs:
           echo "Last RPC log lines:"
           tail -n 20 /tmp/llama-rpc.log || true
           echo ""
-          echo "RPC server running. Starting monitor and keepalive..."
-
-          MAIN_IP="${{ inputs.main_ip }}"
+          echo "RPC server running. Keeping worker alive for roughly 6 hours..."
 
           END_TIME=$((SECONDS + KEEPALIVE_SECONDS))
-          TICK=0
-
           while [ "$SECONDS" -lt "$END_TIME" ]; do
-            sleep 30
-            TICK=$((TICK + 1))
-
-            # Check RPC server is still alive
             if ! kill -0 "$RPC_PID" 2>/dev/null; then
               echo "RPC server stopped unexpectedly"
               cat /tmp/llama-rpc.log || true
               exit 1
             fi
-
-            # Every 60 seconds: collect stats and send to main node
-            if [ $((TICK % 2)) -eq 0 ]; then
-              # --- CPU usage (1-second sample via mpstat) ---
-              CPU_IDLE=$(mpstat 1 1 2>/dev/null | awk '/Average/ {print $NF}' || echo "?")
-              if [ "$CPU_IDLE" != "?" ]; then
-                CPU_USED=$(awk "BEGIN {printf \"%.1f\", 100 - $CPU_IDLE}")
-              else
-                CPU_USED="?"
-              fi
-
-              # --- RAM usage ---
-              RAM_INFO=$(free -m 2>/dev/null | awk '/Mem:/ {printf "%dMB used / %dMB total", $3, $2}' || echo "?")
-
-              # --- Active RPC connections from main node ---
-              RPC_CONNS=$(ss -tn 2>/dev/null | grep ":$RPC_PORT" | grep -c "ESTAB" || echo "0")
-
-              # --- RPC log tail (last meaningful line, stripped of control chars) ---
-              RPC_LAST=$(tail -n 3 /tmp/llama-rpc.log 2>/dev/null | tr -d '\r' | tail -n 1 || echo "")
-
-              # --- Build the report line ---
-              REPORT="WORKER $WORKER_ID [$WORKER_IP] | CPU: ${CPU_USED}% | RAM: $RAM_INFO | RPC conns: $RPC_CONNS | $RPC_LAST"
-
-              echo "[$(date -u '+%H:%M:%S')] $REPORT"
-
-              # --- Send to main node via nc (best-effort, never fail the worker) ---
-              if [ -n "$MAIN_IP" ]; then
-                echo "$REPORT" | nc -w 2 "$MAIN_IP" "$STATS_PORT" 2>/dev/null || true
-              fi
-            fi
+            sleep 30
           done
 
       - name: Cleanup on exit
