@@ -110,12 +110,12 @@ jobs:
           set -euxo pipefail
           cd llama.cpp
           ls -la build/bin/
-          for bin in llama-server ggml-rpc-server; do
-            if [ ! -x "./build/bin/$bin" ]; then
-              echo "Could not find $bin binary"
-              exit 1
-            fi
-          done
+          # The main server only needs llama-server; the RPC server binary lives on
+          # the worker nodes and its name varies across llama.cpp builds.
+          if [ ! -x "./build/bin/llama-server" ]; then
+            echo "Could not find llama-server binary"
+            exit 1
+          fi
           echo "LLAMA_BIN=$(pwd)/build/bin" >> "$GITHUB_ENV"
 
       - name: Install Tailscale
@@ -345,7 +345,7 @@ jobs:
           nohup "$LLAMA_BIN/llama-server" \
             -m "$MODEL_PATH" \
             --rpc "$ACTIVE_WORKER_ENDPOINTS" \
-            -c 32768 \
+            -c 50000 \
             -np 1 \
             --host 0.0.0.0 \
             --port "$SERVER_PORT" \
@@ -463,7 +463,13 @@ jobs:
           : > "$REPORT_FILE"
 
           for ip in "${WORKERS[@]}"; do
-            if nc -z -w 3 "${ip}" "${RPC_PORT}" 2>/dev/null; then
+            # Use established-socket check rather than nc -z: once llama-server
+            # holds the persistent RPC session the worker's listen backlog is
+            # saturated and fresh TCP connects time out even though the worker is
+            # actively serving.
+            live_socks="$(ss -tn state established "( dst ${ip}:${RPC_PORT} )" 2>/dev/null \
+                          | tail -n +2 | wc -l | tr -d ' ')"
+            if [ "${live_socks:-0}" -gt 0 ]; then
               REACHABLE="yes"
             else
               REACHABLE="no"
@@ -705,16 +711,24 @@ jobs:
             fi
 
             # 2. Every 5 minutes (10 ticks), probe each worker.
+            # NOTE: ggml-rpc-server accepts exactly one persistent connection from
+            # llama-server.  After that handshake the server stops accepting new TCP
+            # connects, so a fresh `nc -z` probe will always fail (connection refused
+            # or timeout) even while the worker is actively serving.  Instead, we
+            # check for an established socket from this runner to each worker — that
+            # is what actually indicates the worker is alive and connected.
             if [ $((TICK % 10)) -eq 0 ]; then
               unreachable=0
               for ip in "${WORKERS[@]}"; do
-                if ! nc -z -w 3 "${ip}" "${RPC_PORT}" 2>/dev/null; then
-                  echo "[ $(date -u '+%H:%M:%S') ] WARNING: worker ${ip}:${RPC_PORT} unreachable"
+                live_socks="$(ss -tn state established "( dst ${ip}:${RPC_PORT} )" 2>/dev/null \
+                              | tail -n +2 | wc -l | tr -d ' ')"
+                if [ "${live_socks:-0}" -eq 0 ]; then
+                  echo "[ $(date -u '+%H:%M:%S') ] WARNING: worker ${ip}:${RPC_PORT} has no established RPC socket"
                   unreachable=$((unreachable + 1))
                 fi
               done
               if [ "$unreachable" -gt 0 ]; then
-                echo "[ $(date -u '+%H:%M:%S') ] ${unreachable}/${#WORKERS[@]} workers unreachable"
+                echo "[ $(date -u '+%H:%M:%S') ] ${unreachable}/${#WORKERS[@]} workers lost RPC connection"
               fi
             fi
 
