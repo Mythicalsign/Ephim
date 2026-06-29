@@ -55,6 +55,17 @@ on:
         description: 'Optional comma list of weights, e.g. "1,1,1" for equal split (leave blank for auto)'
         required: false
         default: ''
+      model_choice:
+        description: 'Model to serve (sets repo + file automatically)'
+        required: true
+        default: 'Qwen3-Coder 30B A3B'
+        type: choice
+        options:
+          - 'Qwen3-Coder 30B A3B'
+          - 'Qwen3.6 27B'
+          - 'Gemma 4 E4B'
+          - 'Devstral Small 2 (24B)'
+          - 'FLUX.2 Klein 4B  WARNING IMAGE MODEL - not supported by llama-server'
       run_distribution_test:
         description: 'Run a test inference to verify all workers receive traffic'
         required: false
@@ -70,9 +81,9 @@ jobs:
       RPC_PORT: '50052'
       SERVER_PORT: '8080'
       API_KEY: 'sk-local-llama'
-      MODEL_REPO: 'unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF'
-      MODEL_FILE: 'Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf'
       MODEL_DIR: '/home/runner/models'
+      # MODEL_REPO and MODEL_FILE are set dynamically by the
+      # "Resolve model configuration" step based on model_choice input.
 
     steps:
       - name: Install system dependencies
@@ -146,6 +157,70 @@ jobs:
 
           echo "Tailscale IPv4 was not assigned in time"
           exit 1
+
+      - name: Resolve model configuration
+        shell: bash
+        env:
+          MODEL_CHOICE: ${{ inputs.model_choice }}
+        run: |
+          set -euo pipefail
+
+          # ---------------------------------------------------------------
+          # Map the dropdown selection to a HuggingFace repo + GGUF file.
+          # All three text models are Unsloth Dynamic 2.0 Q4_K_XL quants —
+          # the best balance of quality and size for CPU-RPC inference.
+          #
+          # FLUX.2 Klein 4B is a text-to-image DIFFUSION model (Black Forest
+          # Labs). It is served by stable-diffusion.cpp / ComfyUI-GGUF, NOT
+          # by llama-server. Selecting it intentionally hard-fails here so
+          # the error is obvious rather than a cryptic load failure later.
+          # ---------------------------------------------------------------
+
+          case "$MODEL_CHOICE" in
+            'Qwen3-Coder 30B A3B')
+              REPO='unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF'
+              FILE='Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf'
+              ;;
+            'Qwen3.6 27B')
+              REPO='unsloth/Qwen3.6-27B-GGUF'
+              FILE='Qwen3.6-27B-UD-Q4_K_XL.gguf'
+              ;;
+            'Gemma 4 E4B')
+              REPO='unsloth/gemma-4-E4B-it-GGUF'
+              FILE='gemma-4-E4B-it-UD-Q4_K_XL.gguf'
+              ;;
+            'Devstral Small 2 (24B)')
+              REPO='unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF'
+              FILE='Devstral-Small-2-24B-Instruct-2512-UD-Q4_K_XL.gguf'
+              ;;
+            'FLUX.2 Klein 4B  WARNING IMAGE MODEL - not supported by llama-server')
+              echo ""
+              echo "=========================================================="
+              echo "  ERROR: FLUX.2 Klein 4B is a text-to-IMAGE diffusion"
+              echo "  model (Black Forest Labs). It cannot be loaded by"
+              echo "  llama-server. Use stable-diffusion.cpp or ComfyUI"
+              echo "  with the ComfyUI-GGUF node instead."
+              echo ""
+              echo "  HuggingFace repo: unsloth/FLUX.2-klein-4B-GGUF"
+              echo "  ComfyUI-GGUF:     https://github.com/city96/ComfyUI-GGUF"
+              echo "=========================================================="
+              echo ""
+              exit 1
+              ;;
+            *)
+              echo "Unknown model_choice: '$MODEL_CHOICE'"
+              exit 1
+              ;;
+          esac
+
+          echo "MODEL_REPO=$REPO" >> "$GITHUB_ENV"
+          echo "MODEL_FILE=$FILE"  >> "$GITHUB_ENV"
+
+          echo ""
+          echo "Model selected : $MODEL_CHOICE"
+          echo "HuggingFace repo: $REPO"
+          echo "GGUF file       : $FILE"
+          echo ""
 
       - name: Collect and validate active workers
         shell: bash
